@@ -757,6 +757,50 @@ class STTService:
             except Exception as e:
                 logger.error(f"Failed to feed audio to recorder: {e}")
 
+    async def run_transcription_loop(self):
+        """
+        Active loop that waits for and processes final transcriptions.
+
+        This is necessary because RealtimeSTT doesn't provide an on_final_transcription
+        callback. Instead, recorder.text() is a blocking call that returns when
+        speech ends and transcription is complete.
+        """
+        logger.info("🎤 STT transcription loop started")
+
+        while not self._is_shutting_down:
+            try:
+                if not self._is_initialized or self._recorder is None:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Run blocking text() call in executor
+                loop = asyncio.get_running_loop()
+                user_message = await loop.run_in_executor(
+                    None,
+                    self._recorder.text
+                )
+
+                # Got a transcription!
+                if user_message:
+                    logger.debug(f"STT loop got transcription: {user_message}")
+
+                    with self._lock:
+                        self._current_transcription = user_message
+
+                    # Fire the on_final_transcription callback
+                    if self.callbacks.on_final_transcription:
+                        await self._run_callback_async(
+                            self.callbacks.on_final_transcription,
+                            user_message
+                        )
+
+            except Exception as e:
+                if not self._is_shutting_down:
+                    logger.error(f"Error in STT transcription loop: {e}", exc_info=True)
+                await asyncio.sleep(0.1)
+
+        logger.info("🎤 STT transcription loop ended")
+
     def start_recording(self):
         """Manually start recording (bypasses VAD wait)"""
         if self._recorder is None:
@@ -1427,10 +1471,15 @@ class WebSocketManager:
     async def start_service_tasks(self):
         """Start background service loops"""
 
-        # STT: Start listening (callback-based, no task needed)
+        # STT: Start listening AND transcription loop
         if self.stt_service:
             self.stt_service.start_listening()
             logger.info("🎤 STT listening started")
+
+            # Start transcription loop that calls recorder.text()
+            stt_task = asyncio.create_task(self.stt_service.run_transcription_loop())
+            self.service_tasks.append(stt_task)
+            logger.info("🎤 STT transcription loop task started")
 
         # LLM: Active loop consuming transcription queue
         if self.llm_service:
