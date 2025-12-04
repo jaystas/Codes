@@ -649,37 +649,48 @@ class WebSocketManager:
     """Manages WebSocket connections and their associated state."""
     
     def __init__(self):
-        """"""
-        self.stt_service = STTService()
-
+        self.stt_service: Optional[STTService] = None
+        self.llm_service: Optional[LLMService] = None
+        self.tts_service: Optional[TTSService] = None
         self.websocket: Optional[WebSocket] = None
-    
+
+    async def initialize(self):
+        """Initialize all services with proper callbacks"""
+        # Setup STT callbacks
+        stt_callbacks = STTCallbacks(
+            on_realtime_update=self.on_realtime_update,
+            on_realtime_stabilized=self.on_realtime_stabilized,
+            on_final_transcription=self.on_final_transcription,
+        )
+        
+        self.stt_service = STTService(callbacks=stt_callbacks)
+        self.llm_service = LLMService()
+        self.tts_service = TTSService()
+        
+        await self.stt_service.initialize()
+        await self.llm_service.initialize()
+        await self.tts_service.initialize()
+
     async def connect(self, websocket: WebSocket):
         """Accept WebSocket connection"""
         await websocket.accept()
         self.websocket = websocket
         logger.info("WebSocket connected")
-
+    
     async def disconnect(self):
         """Handle WebSocket disconnection"""
         if self.websocket:
+            await self.websocket.close()
             self.websocket = None
         logger.info("WebSocket disconnected")
 
     async def handle_audio_message(self, audio_data: bytes):
         """Feed audio for transcription"""
-        self.stt_service.feed_audio(audio_data)
+        if self.stt_service:
+            self.stt_service.feed_audio(audio_data)
 
-    async def handle_text_message(self, websocket: WebSocket, message: str):
-        """
-        Handle incoming text messages from the client.
-        
-        Expected message format (JSON):
-        {
-            "type": "message_type",
-            "data": { ... }
-        }
-        """
+    async def handle_text_message(self, message: str):
+        """Handle incoming text messages"""
         try:
             data = json.loads(message)
             message_type = data.get("type", "")
@@ -687,82 +698,60 @@ class WebSocketManager:
             
             if message_type == "user_message":
                 user_text = payload.get("text", "")
-                # other paramaters?
-                await self.handle_user_message(websocket, user_text)
+                await self.handle_user_message(user_text)
             
             elif message_type == "start_listening":
-                await stt_service.start_listening()
-
-            elif message_type == "stop_listening":
-                await stt_service.stop_listening()
-
-            elif message_type == "set_model":
-                model = data.get("model","")
-                await llm_service.set_model(model)
+                self.stt_service.start_listening()
             
+            elif message_type == "stop_listening":
+                self.stt_service.stop_listening()
+            
+            elif message_type == "set_model":
+                model = data.get("model", "")
+                self.llm_service.set_model(model)
+                
         except Exception as e:
             logger.error(f"Error handling message: {e}")
 
-    async def handle_user_message(websocket: WebSocket, user_text: str, llm: LLMService, tts: TTSService):
+    async def handle_user_message(self, user_text: str):
         """Process a chat message through LLM and optionally TTS."""
 
+        user_text
 
 
-    async def send_text_message(websocket: WebSocket, data: dict):
-        """Send a JSON text message to the client."""
-        try:
-            await websocket.send_text(json.dumps(data))
-        except Exception as e:
-            print(f"Error sending text message: {e}")
-
-    async def stream_audio_to_client(websocket: WebSocket, audio_data: bytes):
-        """Send binary data (audio) to the client."""
-        try:
-            await websocket.send_bytes(audio_data)
-        except Exception as e:
-            print(f"Error sending binary message: {e}")
-
+    async def send_text_message(self, data: dict):
+        """Send JSON message to client"""
+        if self.websocket:
+            await self.websocket.send_text(json.dumps(data))
+    
+    async def stream_audio_to_client(self, audio_data: bytes):
+        """Send binary audio to client"""
+        if self.websocket:
+            await self.websocket.send_bytes(audio_data)
 
     async def on_realtime_update(self, text: str):
-        print(f"[Realtime Update] {text}")
-        await self.websocket.send_json({"type": "stt_update", "text": text})
+        await self.send_text_message({"type": "stt_update", "text": text})
     
     async def on_realtime_stabilized(self, text: str):
-        print(f"[Stabilized] {text}")
-        await self.websocket.send_json({"type": "stt_stabilized", "text": text})
+        await self.send_text_message({"type": "stt_stabilized", "text": text})
     
     async def on_final_transcription(self, text: str):
-        print(f"[Final] {text}")
-        await self.websocket.send_json({"type": "stt_final", "text": text})
-
-########################################
-##--         Global Instances       --##
-########################################
-
-stt_service = STTService()
-llm_service = LLMService()
-tts_service = TTSService()
-pipeline = Pipeline()
-ws_manager = WebSocketManager()
+        await self.send_text_message({"type": "stt_final", "text": text})
 
 ########################################
 ##--           FastAPI App          --##
 ########################################
 
+ws_manager = WebSocketManager()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ws_manager.initialize()
     print("Starting up services...")
-    await stt_service.initialize()
-    await llm_service.initialize()
-    await tts_service.initialize()
+    await ws_manager.initialize()
     print("All services initialized!")
     yield
-    ws_manager.shutdown()
     print("Shutting down services...")
-    await stt_service.shutdown()
-    await llm_service.shutdown()
-    await tts_service.shutdown()
+    await ws_manager.shutdown()
     print("All services shut down!")
 
 app = FastAPI(lifespan=lifespan)
@@ -781,44 +770,24 @@ app.add_middleware(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    Main WebSocket endpoint.
-    Handles both text and binary audio messages.
-    """
-
     await ws_manager.connect(websocket)
     
     try:
-        # Main message loop
         while True:
             message = await websocket.receive()
             
             if "text" in message:
-                await ws_manager.handle_text_message(
-                    websocket=websocket,
-                    message=message["text"],
-                    manager=ws_manager,
-                    stt=stt_service,
-                    llm=llm_service,
-                    tts=tts_service,
-                )
+                await ws_manager.handle_text_message(message["text"])
             
             elif "bytes" in message:
-                await ws_manager.handle_audio_message(
-                    websocket=websocket,
-                    audio_data=message["bytes"],
-                    manager=ws_manager,
-                    stt=stt_service,
-                    llm=llm_service,
-                    tts=tts_service,
-                )
+                await ws_manager.handle_audio_message(message["bytes"])
     
     except WebSocketDisconnect:
-        ws_manager.disconnect()
+        await ws_manager.disconnect()
     
     except Exception as e:
-        print(f"WebSocket error: {e}")
-        ws_manager.disconnect()
+        logger.error(f"WebSocket error: {e}")
+        await ws_manager.disconnect()
 
 ########################################
 ##--           Run Server           --##
