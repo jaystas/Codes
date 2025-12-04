@@ -66,6 +66,21 @@ logger.setLevel(logging.INFO)
 sys.path.append('/workspace/tts/Code')
 
 
+class Character(BaseModel):
+    id: str
+    name: str
+    voice: str = ""
+    system_prompt: str = ""
+    image_url: str = ""
+    images: List[str] = []
+    is_active: bool
+
+class Message(BaseModel):
+    """Single message in conversation history"""
+    role: str
+    name: str
+    content: str
+
 class STTState(Enum):
     """STT Service states"""
     IDLE = auto()
@@ -125,8 +140,8 @@ class STTCallbacks:
     # VAD callbacks - useful for interrupt detection
     on_vad_start: Optional[Callable[[], Any]] = None
     on_vad_stop: Optional[Callable[[], Any]] = None
-    on_voice_detected: Optional[Callable[[], Any]] = None  # Maps to on_vad_detect_start
-    on_voice_ended: Optional[Callable[[], Any]] = None     # Maps to on_vad_detect_stop
+    on_vad_detect_start: Optional[Callable[[], Any]] = None
+    on_vad_detect_stop: Optional[Callable[[], Any]] = None
     
     # Recording lifecycle callbacks
     on_recording_start: Optional[Callable[[], Any]] = None
@@ -135,6 +150,31 @@ class STTCallbacks:
     # Turn detection (silence during speech)
     on_turn_start: Optional[Callable[[], Any]] = None
     on_turn_end: Optional[Callable[[], Any]] = None
+
+########################################
+##--             Queues             --##
+########################################
+
+class Queues:
+    """Manages all queues"""
+
+    def __init__(self):
+
+        # STT → LLM Orchestrator
+        self.transcribed_text = asyncio.Queue()
+
+        # LLM → Browser (for text display)
+        self.display_queue = asyncio.Queue()
+
+        # LLM → TTS (with speaker info and sequence)
+        self.sentence_queue = asyncio.Queue()
+
+        # TTS → Audio Sequencer
+        self.audio_queue = asyncio.Queue()
+
+        # Control signals
+        self.stop_signal = asyncio.Event()
+        self.interrupt_signal = asyncio.Event()
 
 ########################################
 ##--           STT Service          --##
@@ -329,50 +369,32 @@ class STTService:
             except Exception as e:
                 logger.error(f"Failed to feed audio to recorder: {e}")
 
-    async def transcribe_audio_message(self, timeout: float = 30.0) -> str:
-        """
-        Wait for and return the final transcription.
-        
-        This method blocks until:
-        - Voice activity is detected and recording completes
-        - The transcription is processed
-        
-        Args:
-            timeout: Maximum time to wait for transcription
-            
-        Returns:
-            Final transcription text
-        """
+    async def transcribe_audio_message(self) -> str:
+        """transcribes user audio message"""
         if not self._is_initialized or self._recorder is None:
             return ""
-            
+        
         try:
-            # Run the blocking text() call in a thread pool
             loop = asyncio.get_running_loop()
             
             with self._lock:
                 self._state = STTState.LISTENING
                 
-            text = await asyncio.wait_for(
+            user_message = await asyncio.wait_for(
                 loop.run_in_executor(None, self._recorder.text),
-                timeout=timeout
             )
             
             with self._lock:
                 self._state = STTState.IDLE
-                self._current_transcription = text or ""
+                self._current_transcription = user_message or ""
                 
             # Fire final transcription callback
-            if text and self.callbacks.on_final_transcription:
-                await self._run_callback_async(
-                    self.callbacks.on_final_transcription, 
-                    text
-                )
+            if user_message and self.callbacks.on_final_transcription:
+                await self._run_callback_async(self.callbacks.on_final_transcription, user_message)
                 
-            return text or ""
+            return user_message or ""
             
         except asyncio.TimeoutError:
-            logger.warning("Transcription timed out")
             self.stop_listening()
             return ""
         except Exception as e:
@@ -441,16 +463,16 @@ class STTService:
         with self._lock:
             self._voice_active = True
             
-        if self.callbacks.on_voice_detected:
-            self._schedule_callback(self.callbacks.on_voice_detected)
+        if self.callbacks.on_vad_detect_start:
+            self._schedule_callback(self.callbacks.on_vad_detect_start)
     
     def _on_vad_detect_stop(self):
         """Called when system stops listening for voice activity"""
         with self._lock:
             self._voice_active = False
             
-        if self.callbacks.on_voice_ended:
-            self._schedule_callback(self.callbacks.on_voice_ended)
+        if self.callbacks.on_vad_detect_stop:
+            self._schedule_callback(self.callbacks.on_vad_detect_stop)
     
     def _on_vad_start(self):
         """
@@ -539,35 +561,124 @@ class STTService:
 ########################################
 
 class LLMService:
-    """LLM Service - generates responses from text."""
-    
-    def __init__(self):
+    """LLM Service"""
+
+    def __init__(self, api_key: str, queues=Queues):
         self.is_initialized = False
-        self.api_key: str | None = None
+        self.queues = queues
+        self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
         self.model: str 
     
     async def initialize(self):
-        """Initialize the LLM service."""
-        # TODO: Set up API client, load API key from environment
         self.is_initialized = True
         print("LLMService initialized")
     
-    async def generate_response(self, user_text: str, system_prompt: str = "") -> str:
-        """Generate a response from user text."""
-        # TODO: Implement LLM API call
-        pass
-    
-    async def generate_response_stream(self, user_text: str, system_prompt: str = ""):
-        """Generate a streaming response (async generator)."""
-        # TODO: Implement streaming LLM response
-        # yield chunks of text as they arrive
-        yield ""
-
     def set_model(self, model: str):
         """Set the current LLM model"""
         self.model = model
         logger.info(f"LLM model set to: {model}")
+
+    def strip_character_tags(self, text: str) -> str:
+        """Strip character tags from text for display/TTS purposes"""
+        return re.sub(r'<[^>]+>', '', text).strip()
     
+    def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
+        """Parse a message for character mentions in order of appearance"""
+        mentioned_characters = []
+        processed_characters = set()
+
+        # Create an array of all possible name mentions with their positions
+        name_mentions = []
+
+        for character in active_characters:
+            name_parts = character.name.lower().split()
+
+            for name_part in name_parts:
+                # Find all occurrences of this name part in the message
+                pattern = r'\b' + re.escape(name_part) + r'\b'
+                for match in re.finditer(pattern, message, re.IGNORECASE):
+                    name_mentions.append({
+                        'character': character,
+                        'position': match.start(),
+                        'name_part': name_part
+                    })
+
+        # Sort by position in the message
+        name_mentions.sort(key=lambda x: x['position'])
+
+        # Add characters in order of first mention, avoiding duplicates
+        for mention in name_mentions:
+            if mention['character'].id not in processed_characters:
+                mentioned_characters.append(mention['character'])
+                processed_characters.add(mention['character'].id)
+
+        # If no one was mentioned, all active characters respond (in order)
+        if not mentioned_characters:
+            mentioned_characters = sorted(active_characters, key=lambda c: c.name)
+
+        return mentioned_characters 
+
+    def build_character_prompt(
+        self,
+        character: Character,
+        conversation_history: List[Message]
+    ) -> List[Dict[str, str]]:
+        """
+        Build LLM prompt for a specific character.
+
+        Returns messages array for OpenRouter/OpenAI API format.
+        """
+        messages = []
+
+        # Add character's system prompt
+        messages.append({
+            "role": "system",
+            "content": character.system_prompt
+        })
+
+        # Add conversation history
+        for msg in conversation_history:
+            message_dict = {
+                "role": msg.role,
+                "content": msg.content
+            }
+            # Add name field if available (for multi-character conversations)
+            if msg.name:
+                message_dict["name"] = msg.name
+            messages.append(message_dict)
+
+        # Add instruction for this turn
+        instruction = (
+            f"Based on the conversation history above, provide the next reply as {character.name}. "
+            f"Your response should include only {character.name}'s reply. "
+            f"Do not respond for/as anyone else. "
+            f"Wrap your entire response in <{character.name}></{character.name}> tags."
+        )
+
+        messages.append({
+            "role": "system",
+            "content": instruction
+        })
+
+        return messages
+    
+
+    async def run_llm_loop(self):
+        """Continuously running LLM processing loop"""
+        
+        while True:
+            try:
+
+                user_message = await self.queues.transcribed_text.get()
+
+
+
+
+
+            except Exception as e:
+                logger.error(f"LLM loop error: {e}")
+
+
     async def shutdown(self):
         """Clean up LLM resources."""
         self.is_initialized = False
@@ -621,13 +732,15 @@ class Pipeline:
         """Start all services including audio sequencer"""
 
         self.pipeline_tasks = [
-            asyncio.create_task(self.stt.run_stt_pipeline()),
-            asyncio.create_task(self.llm.run_llm_pipeline()),
-            asyncio.create_task(self.tts.run_tts_pipeline())
+            asyncio.create_task(self.stt.run_stt_loop()),
+            asyncio.create_task(self.llm.run_llm_loop()),
+            asyncio.create_task(self.tts.run_tts_loop())
         ]
 
     async def run_pipeline_loop(self, audio_data: bytes, stt:STTService, llm: LLMService, tts: TTSService):
         """continuously runs text to audio stream pipeline"""
+
+        # I'm trying to figure out if should run here or in one of stt / llm loop.
 
         stt = STTService(config, callbacks)
         await stt.initialize()
@@ -653,6 +766,7 @@ class WebSocketManager:
         self.llm_service: Optional[LLMService] = None
         self.tts_service: Optional[TTSService] = None
         self.websocket: Optional[WebSocket] = None
+        self.queues: Optional[Queues] = None
 
     async def initialize(self):
         """Initialize all services with proper callbacks"""
@@ -666,7 +780,9 @@ class WebSocketManager:
         self.stt_service = STTService(callbacks=stt_callbacks)
         self.llm_service = LLMService()
         self.tts_service = TTSService()
-        
+        self.queues = Queues()
+
+        await self.queues.initialize()
         await self.stt_service.initialize()
         await self.llm_service.initialize()
         await self.tts_service.initialize()
@@ -697,8 +813,8 @@ class WebSocketManager:
             payload = data.get("data", {})
             
             if message_type == "user_message":
-                user_text = payload.get("text", "")
-                await self.handle_user_message(user_text)
+                user_message = payload.get("text", "")
+                await self.handle_user_message(user_message)
             
             elif message_type == "start_listening":
                 self.stt_service.start_listening()
@@ -713,11 +829,9 @@ class WebSocketManager:
         except Exception as e:
             logger.error(f"Error handling message: {e}")
 
-    async def handle_user_message(self, user_text: str):
-        """Process a chat message through LLM and optionally TTS."""
-
-        user_text
-
+    async def handle_user_message(self, user_message: str):
+        """Process manually sent user message"""
+        await self.queues.transcribed_text.put(user_message)
 
     async def send_text_message(self, data: dict):
         """Send JSON message to client"""
@@ -735,8 +849,13 @@ class WebSocketManager:
     async def on_realtime_stabilized(self, text: str):
         await self.send_text_message({"type": "stt_stabilized", "text": text})
     
-    async def on_final_transcription(self, text: str):
-        await self.send_text_message({"type": "stt_final", "text": text})
+    async def on_final_transcription(self, user_message: str):
+        
+        # put transcribed text into queue for llm to get
+        await self.queues.transcribed_text.put(user_message)
+
+        # send final text to client for user's prompt UI display
+        await self.send_text_message({"type": "stt_final", "text": user_message})
 
 ########################################
 ##--           FastAPI App          --##
