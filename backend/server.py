@@ -51,8 +51,13 @@ from enum import Enum, auto
 from backend.RealtimeSTT import AudioToTextRecorder
 from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
-from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent
+from backend.boson_multimodal.data_types import ChatMLSample, AudioContent
+from backend.boson_multimodal.data_types import Message as HiggsMessage  # Alias to avoid conflict
 from backend.RealtimeTTS.threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
+
+# Streaming pipeline imports
+from concurrent.futures import ThreadPoolExecutor
+import stream2sentence as s2s
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
@@ -151,6 +156,34 @@ class STTCallbacks:
     on_turn_start: Optional[Callable[[], Any]] = None
     on_turn_end: Optional[Callable[[], Any]] = None
 
+
+########################################
+##--      Streaming Data Classes    --##
+########################################
+
+@dataclass
+class SentenceChunk:
+    """A complete sentence ready for TTS"""
+    text: str
+    speaker: Character
+    voice: Optional[str]
+    sequence_number: int
+    sentence_index: int      # Which sentence in this response (0, 1, 2...)
+    is_final: bool           # Last sentence of this character's response
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class TextChunk:
+    """Text chunk for UI streaming"""
+    text: str
+    is_final: bool
+    speaker_name: str
+    sequence_number: int
+    chunk_index: int
+    timestamp: float = field(default_factory=time.time)
+
+
 ########################################
 ##--             Queues             --##
 ########################################
@@ -163,18 +196,373 @@ class Queues:
         # STT → LLM Orchestrator
         self.transcribed_text = asyncio.Queue()
 
-        # LLM → Browser (for text display)
-        self.display_queue = asyncio.Queue()
+        # LLM → Browser (for text display) - renamed for consistency
+        self.text_output = asyncio.Queue()
 
-        # LLM → TTS (with speaker info and sequence)
-        self.sentence_queue = asyncio.Queue()
+        # LLM → TTS (sentence chunks, not full responses) - renamed for clarity
+        self.tts_requests = asyncio.Queue()
 
-        # TTS → Audio Sequencer
-        self.audio_queue = asyncio.Queue()
+        # TTS → Audio Sequencer - renamed for consistency
+        self.audio_output = asyncio.Queue()
 
         # Control signals
         self.stop_signal = asyncio.Event()
         self.interrupt_signal = asyncio.Event()
+
+
+########################################
+##-- Streaming Sentence Extractor   --##
+########################################
+
+class StreamingSentenceExtractor:
+    """
+    Bridges async LLM text stream to synchronous stream2sentence library.
+
+    Architecture:
+    - Async side: Receives text chunks, feeds to CharIterator
+    - Sync side: stream2sentence extracts sentences in background thread
+    - Output: Sentences are pushed to an async queue as they're detected
+
+    This enables true streaming: first sentence starts TTS while LLM is still
+    generating subsequent text.
+    """
+
+    def __init__(
+        self,
+        sentence_callback: Callable[[str, int], None] = None,
+        # stream2sentence parameters - tuned for TTS latency
+        minimum_sentence_length: int = 10,
+        minimum_first_fragment_length: int = 10,
+        quick_yield_single_sentence_fragment: bool = True,
+        cleanup_text_links: bool = True,
+        cleanup_text_emojis: bool = False,
+        tokenize_sentences: bool = False,
+    ):
+        """
+        Args:
+            sentence_callback: Called with (sentence_text, sentence_index) for each sentence
+            minimum_sentence_length: Min chars before yielding a sentence
+            minimum_first_fragment_length: Min chars for first fragment
+            quick_yield_single_sentence_fragment: Yield single sentences quickly
+            cleanup_text_links: Remove URLs from text
+            cleanup_text_emojis: Remove emojis from text
+            tokenize_sentences: Use NLTK tokenization (slower, more accurate)
+        """
+        self.sentence_callback = sentence_callback
+
+        # stream2sentence config
+        self.s2s_config = {
+            "minimum_sentence_length": minimum_sentence_length,
+            "minimum_first_fragment_length": minimum_first_fragment_length,
+            "quick_yield_single_sentence_fragment": quick_yield_single_sentence_fragment,
+            "cleanup_text_links": cleanup_text_links,
+            "cleanup_text_emojis": cleanup_text_emojis,
+            "tokenize_sentences": tokenize_sentences,
+        }
+
+        # Thread-safe components
+        self.char_iter: Optional[CharIterator] = None
+        self.thread_safe_iter: Optional[AccumulatingThreadSafeGenerator] = None
+
+        # Sentence output queue (thread-safe)
+        self.sentence_queue: Queue = Queue()
+
+        # Control
+        self._extraction_thread: Optional[threading.Thread] = None
+        self._is_running = False
+        self._is_complete = False
+        self._sentence_count = 0
+        self._accumulated_text = ""
+
+        # Thread pool for non-blocking operations
+        self._executor = ThreadPoolExecutor(max_workers=1)
+
+    def start(self):
+        """Initialize and start the sentence extraction pipeline"""
+        self.char_iter = CharIterator()
+        self.thread_safe_iter = AccumulatingThreadSafeGenerator(self.char_iter)
+
+        self._is_running = True
+        self._is_complete = False
+        self._sentence_count = 0
+        self._accumulated_text = ""
+
+        # Start extraction thread
+        self._extraction_thread = threading.Thread(
+            target=self._extraction_loop,
+            daemon=True
+        )
+        self._extraction_thread.start()
+
+    def feed_text(self, text: str):
+        """
+        Feed text chunk from LLM stream.
+        Thread-safe, can be called from async context.
+        """
+        if not self._is_running:
+            return
+
+        self._accumulated_text += text
+        self.char_iter.add(text)
+
+    def finish(self):
+        """
+        Signal that LLM stream is complete.
+        Flushes any remaining text as final sentence.
+        """
+        if not self._is_running:
+            return
+
+        self._is_complete = True
+
+        # Signal end to CharIterator
+        if self.char_iter:
+            self.char_iter.add("")  # Empty string can signal completion
+            try:
+                self.char_iter.complete()  # If this method exists
+            except AttributeError:
+                pass
+
+    def _extraction_loop(self):
+        """
+        Background thread: Extract sentences using stream2sentence.
+        Runs until stream is complete and all sentences are extracted.
+        """
+        try:
+            sentence_generator = s2s.generate_sentences(
+                self.thread_safe_iter,
+                **self.s2s_config
+            )
+
+            for sentence in sentence_generator:
+                if not self._is_running:
+                    break
+
+                sentence = sentence.strip()
+                if sentence:
+                    # Push to queue
+                    self.sentence_queue.put((sentence, self._sentence_count))
+
+                    # Callback if provided
+                    if self.sentence_callback:
+                        self.sentence_callback(sentence, self._sentence_count)
+
+                    self._sentence_count += 1
+
+        except Exception as e:
+            logger.error(f"Sentence extraction error: {e}", exc_info=True)
+        finally:
+            # Signal completion
+            self.sentence_queue.put(None)  # Sentinel value
+            self._is_running = False
+
+    async def get_sentences(self) -> AsyncIterator[tuple[str, int]]:
+        """
+        Async generator that yields sentences as they become available.
+        Yields: (sentence_text, sentence_index)
+        """
+        loop = asyncio.get_event_loop()
+
+        while True:
+            try:
+                # Non-blocking check with short timeout
+                result = await loop.run_in_executor(
+                    self._executor,
+                    lambda: self.sentence_queue.get(timeout=0.02)
+                )
+
+                if result is None:  # Sentinel - extraction complete
+                    break
+
+                yield result
+
+            except Empty:
+                # No sentence ready yet, yield control
+                await asyncio.sleep(0.005)
+
+                # Check if we should exit
+                if not self._is_running and self.sentence_queue.empty():
+                    break
+
+    def get_accumulated_text(self) -> str:
+        """Get all text that was fed to the extractor"""
+        return self._accumulated_text
+
+    def shutdown(self):
+        """Clean shutdown"""
+        self._is_running = False
+        if self._extraction_thread and self._extraction_thread.is_alive():
+            self._extraction_thread.join(timeout=1.0)
+        self._executor.shutdown(wait=False)
+
+
+########################################
+##--    LLM Response Streamer       --##
+########################################
+
+class LLMResponseStreamer:
+    """
+    Manages the complete streaming pipeline for a single character response.
+
+    Flow:
+    1. Starts LLM generation
+    2. Streams text chunks to UI queue AND sentence extractor
+    3. Sentences are queued for TTS as soon as detected
+    4. Tracks completion and handles cleanup
+
+    This is instantiated once per character response within LLM Service.
+    """
+
+    def __init__(
+        self,
+        character: Character,
+        voice: Optional[str],
+        sequence_number: int,
+        text_output_queue: asyncio.Queue,
+        tts_request_queue: asyncio.Queue,
+        interrupt_signal: asyncio.Event,
+    ):
+        self.character = character
+        self.voice = voice
+        self.sequence_number = sequence_number
+        self.text_output_queue = text_output_queue
+        self.tts_request_queue = tts_request_queue
+        self.interrupt_signal = interrupt_signal
+
+        # Sentence extractor
+        self.extractor = StreamingSentenceExtractor()
+
+        # Tracking
+        self.chunk_index = 0
+        self.sentence_index = 0
+        self.total_text = ""
+        self.is_complete = False
+
+    async def stream_response(
+        self,
+        llm_stream: AsyncIterator,  # OpenAI streaming response
+    ) -> str:
+        """
+        Process LLM stream, extract sentences, queue for TTS.
+
+        Args:
+            llm_stream: Async iterator from OpenAI client
+
+        Returns:
+            Complete response text
+        """
+        # Start sentence extraction pipeline
+        self.extractor.start()
+
+        # Create task for sentence-to-TTS processing
+        sentence_task = asyncio.create_task(self._process_sentences())
+
+        try:
+            # Stream from LLM
+            async for chunk in llm_stream:
+                # Check for interrupt
+                if self.interrupt_signal.is_set():
+                    logger.warning(f"⚠️ Interrupt during LLM stream for {self.character.name}")
+                    break
+
+                # Extract content from OpenAI chunk
+                content = chunk.choices[0].delta.content
+                if content:
+                    self.total_text += content
+
+                    # Feed to sentence extractor (non-blocking)
+                    self.extractor.feed_text(content)
+
+                    # Stream to UI immediately
+                    text_chunk = TextChunk(
+                        text=content,
+                        is_final=False,
+                        speaker_name=self.character.name,
+                        sequence_number=self.sequence_number,
+                        chunk_index=self.chunk_index,
+                        timestamp=time.time()
+                    )
+                    await self.text_output_queue.put(text_chunk)
+                    self.chunk_index += 1
+
+            # Signal LLM stream complete
+            self.extractor.finish()
+
+            # Send final text chunk to UI
+            final_text_chunk = TextChunk(
+                text="",
+                is_final=True,
+                speaker_name=self.character.name,
+                sequence_number=self.sequence_number,
+                chunk_index=self.chunk_index,
+                timestamp=time.time()
+            )
+            await self.text_output_queue.put(final_text_chunk)
+
+            # Wait for sentence processing to complete
+            await sentence_task
+
+        except Exception as e:
+            logger.error(f"Error in stream_response for {self.character.name}: {e}", exc_info=True)
+            raise
+        finally:
+            self.extractor.shutdown()
+            self.is_complete = True
+
+        return self.total_text
+
+    async def _process_sentences(self):
+        """
+        Process sentences as they're extracted and queue for TTS.
+        Runs concurrently with LLM streaming.
+        """
+        sentences_queued = []
+
+        try:
+            async for sentence, index in self.extractor.get_sentences():
+                # Check for interrupt
+                if self.interrupt_signal.is_set():
+                    break
+
+                sentences_queued.append(sentence)
+                self.sentence_index = index
+
+                # Determine if this might be the last sentence
+                # (We don't know for sure until extractor finishes)
+                is_final = False  # Will be corrected below
+
+                # Queue for TTS immediately
+                sentence_chunk = SentenceChunk(
+                    text=sentence,
+                    speaker=self.character,
+                    voice=self.voice,
+                    sequence_number=self.sequence_number,
+                    sentence_index=index,
+                    is_final=is_final,
+                    timestamp=time.time()
+                )
+                await self.tts_request_queue.put(sentence_chunk)
+
+                logger.info(f"📝 Sentence {index} queued for TTS ({self.character.name}): "
+                      f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+
+            # Mark the last sentence as final
+            if sentences_queued:
+                # Send a "final" marker for this character's TTS
+                final_marker = SentenceChunk(
+                    text="",  # Empty text signals completion
+                    speaker=self.character,
+                    voice=self.voice,
+                    sequence_number=self.sequence_number,
+                    sentence_index=self.sentence_index + 1,
+                    is_final=True,
+                    timestamp=time.time()
+                )
+                await self.tts_request_queue.put(final_marker)
+
+        except Exception as e:
+            logger.error(f"Error processing sentences for {self.character.name}: {e}", exc_info=True)
+
 
 ########################################
 ##--           STT Service          --##
@@ -369,38 +757,6 @@ class STTService:
             except Exception as e:
                 logger.error(f"Failed to feed audio to recorder: {e}")
 
-    async def transcribe_audio_message(self) -> str:
-        """transcribes user audio message"""
-        if not self._is_initialized or self._recorder is None:
-            return ""
-        
-        try:
-            loop = asyncio.get_running_loop()
-            
-            with self._lock:
-                self._state = STTState.LISTENING
-                
-            user_message = await asyncio.wait_for(
-                loop.run_in_executor(None, self._recorder.text),
-            )
-            
-            with self._lock:
-                self._state = STTState.IDLE
-                self._current_transcription = user_message or ""
-                
-            # Fire final transcription callback
-            if user_message and self.callbacks.on_final_transcription:
-                await self._run_callback_async(self.callbacks.on_final_transcription, user_message)
-                
-            return user_message or ""
-            
-        except asyncio.TimeoutError:
-            self.stop_listening()
-            return ""
-        except Exception as e:
-            logger.error(f"Error getting transcription: {e}")
-            return ""
-    
     def start_recording(self):
         """Manually start recording (bypasses VAD wait)"""
         if self._recorder is None:
@@ -561,27 +917,40 @@ class STTService:
 ########################################
 
 class LLMService:
-    """LLM Service"""
+    """LLM Service with streaming sentence extraction"""
 
-    def __init__(self, api_key: str, queues=Queues):
+    def __init__(self, api_key: str, queues: Queues):
         self.is_initialized = False
         self.queues = queues
-        self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-        self.model: str 
-    
+        self.client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key
+        )
+        self.model: str = "anthropic/claude-3.5-sonnet"
+
+        # Conversation state (simplified for now)
+        self.conversation_history: List[Message] = []
+        self.current_character: Optional[Character] = None
+        self.sequence_number = 0
+
     async def initialize(self):
         self.is_initialized = True
-        print("LLMService initialized")
-    
+        logger.info("LLMService initialized")
+
     def set_model(self, model: str):
         """Set the current LLM model"""
         self.model = model
         logger.info(f"LLM model set to: {model}")
 
+    def set_character(self, character: Character):
+        """Set current active character"""
+        self.current_character = character
+        logger.info(f"Active character set to: {character.name}")
+
     def strip_character_tags(self, text: str) -> str:
         """Strip character tags from text for display/TTS purposes"""
         return re.sub(r'<[^>]+>', '', text).strip()
-    
+
     def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
         """Parse a message for character mentions in order of appearance"""
         mentioned_characters = []
@@ -616,7 +985,7 @@ class LLMService:
         if not mentioned_characters:
             mentioned_characters = sorted(active_characters, key=lambda c: c.name)
 
-        return mentioned_characters 
+        return mentioned_characters
 
     def build_character_prompt(
         self,
@@ -647,120 +1016,355 @@ class LLMService:
                 message_dict["name"] = msg.name
             messages.append(message_dict)
 
-        # Add instruction for this turn
-        instruction = (
-            f"Based on the conversation history above, provide the next reply as {character.name}. "
-            f"Your response should include only {character.name}'s reply. "
-            f"Do not respond for/as anyone else. "
-            f"Wrap your entire response in <{character.name}></{character.name}> tags."
-        )
-
-        messages.append({
-            "role": "system",
-            "content": instruction
-        })
-
         return messages
-    
 
     async def run_llm_loop(self):
-        """Continuously running LLM processing loop"""
-        
-        while True:
+        """Main loop: consume transcriptions, generate streaming responses"""
+        logger.info("🚀 LLM Service loop started")
+
+        while not self.queues.stop_signal.is_set():
             try:
+                # Wait for user transcription
+                user_message = await asyncio.wait_for(
+                    self.queues.transcribed_text.get(),
+                    timeout=0.1
+                )
 
-                user_message = await self.queues.transcribed_text.get()
+                logger.info(f"💬 LLM received transcription: {user_message}")
 
+                # Add to conversation history
+                self.conversation_history.append(Message(
+                    role="user",
+                    name="User",
+                    content=user_message
+                ))
 
+                # Generate streaming response
+                await self._generate_streaming_response(user_message)
 
-
-
+            except asyncio.TimeoutError:
+                continue
             except Exception as e:
-                logger.error(f"LLM loop error: {e}")
+                logger.error(f"LLM loop error: {e}", exc_info=True)
+                continue
 
+    async def _generate_streaming_response(self, user_message: str):
+        """Generate streaming response with real-time sentence extraction"""
+
+        if not self.current_character:
+            logger.warning("No character set for LLM response")
+            return
+
+        self.sequence_number += 1
+        character = self.current_character
+
+        logger.info(f"🎭 Generating streaming response for {character.name} (seq {self.sequence_number})")
+
+        # Build prompt
+        messages = self.build_character_prompt(character, self.conversation_history)
+
+        try:
+            # Create LLM stream
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                temperature=0.7,
+            )
+
+            # Create response streamer
+            streamer = LLMResponseStreamer(
+                character=character,
+                voice=character.voice,  # Pass voice string
+                sequence_number=self.sequence_number,
+                text_output_queue=self.queues.text_output,
+                tts_request_queue=self.queues.tts_requests,
+                interrupt_signal=self.queues.interrupt_signal,
+            )
+
+            # Process stream - sentences queued for TTS as they're detected
+            response_text = await streamer.stream_response(stream)
+
+            # Strip character tags if present
+            clean_text = self.strip_character_tags(response_text)
+
+            # Add to conversation history
+            self.conversation_history.append(Message(
+                role="assistant",
+                name=character.name,
+                content=clean_text
+            ))
+
+            logger.info(f"✅ {character.name} streaming complete ({streamer.sentence_index + 1} sentences)")
+
+        except Exception as e:
+            logger.error(f"Error generating response for {character.name}: {e}", exc_info=True)
 
     async def shutdown(self):
-        """Clean up LLM resources."""
+        """Clean up LLM resources"""
         self.is_initialized = False
-        print("LLMService shut down")
+        logger.info("LLMService shut down")
 
 ########################################
 ##--           TTS Service          --##
 ########################################
 
 class TTSService:
-    """Text-to-Speech Service - converts text to audio."""
-    
-    def __init__(self):
+    """Text-to-Speech Service with streaming sentence processing"""
+
+    def __init__(self, queues: Queues):
         self.is_initialized = False
+        self.queues = queues
         self.sample_rate: int = 24000
-    
+        self.serve_engine = None
+
+        # Higgs model paths
+        self.model_path = "bosonai/higgs-audio-v2-generation-3B-base"
+        self.tokenizer_path = "bosonai/higgs-audio-v2-tokenizer"
+        self.device = "cuda"
+        self.chunk_size = 64  # Audio tokens per chunk
+
+        # Semaphore to limit concurrent GPU operations
+        self.generation_semaphore = asyncio.Semaphore(3)  # Max 3 concurrent
+
+        # Track active generation tasks
+        self.active_tasks: Dict[tuple, asyncio.Task] = {}
+
     async def initialize(self):
-        """Initialize the TTS model/service."""
-        # TODO: Load your TTS model here (e.g., Higgs Audio)
-        self.is_initialized = True
-        print("TTSService initialized")
-    
-    async def synthesize(self, text: str) -> bytes:
-        """Convert text to audio bytes."""
-        # TODO: Implement text-to-speech
-        pass
-    
-    async def synthesize_stream(self, text: str):
-        """Stream audio chunks as they're generated (async generator)."""
-        # TODO: Implement streaming TTS
-        # yield audio chunks as they're generated
-        yield b""
-    
+        """Initialize the TTS model/service (Higgs)"""
+        try:
+            logger.info("Initializing Higgs Audio TTS engine...")
+            loop = asyncio.get_event_loop()
+            self.serve_engine = await loop.run_in_executor(None, self._create_engine)
+
+            self.is_initialized = True
+            logger.info("✅ TTSService initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize TTS: {e}", exc_info=True)
+            raise
+
+    def _create_engine(self):
+        """Create Higgs engine (runs in thread pool)"""
+        logger.info("Loading Higgs Audio engine...")
+        engine = HiggsAudioServeEngine(
+            self.model_path,
+            self.tokenizer_path,
+            device=self.device,
+            torch_dtype=torch.bfloat16
+        )
+        logger.info("Higgs Audio engine loaded")
+        return engine
+
+    async def run_tts_loop(self):
+        """Main loop: process sentence chunks as they arrive"""
+        logger.info("🚀 TTS Service loop started")
+
+        while not self.queues.stop_signal.is_set():
+            try:
+                # Get sentence chunk
+                sentence: SentenceChunk = await asyncio.wait_for(
+                    self.queues.tts_requests.get(),
+                    timeout=0.05  # Short timeout for responsiveness
+                )
+
+                # Check for interrupt
+                if self.queues.interrupt_signal.is_set():
+                    await self._cancel_all_tasks()
+                    self.queues.interrupt_signal.clear()
+                    continue
+
+                # Skip empty final markers
+                if not sentence.text.strip():
+                    if sentence.is_final:
+                        logger.info(f"✅ TTS complete signal for {sentence.speaker.name}")
+                    continue
+
+                logger.info(f"🎤 TTS received sentence {sentence.sentence_index}: {sentence.text[:50]}...")
+
+                # Start TTS generation immediately for this sentence (concurrent)
+                task_key = (
+                    sentence.speaker.name,
+                    sentence.sequence_number,
+                    sentence.sentence_index
+                )
+
+                task = asyncio.create_task(
+                    self._generate_sentence_audio(sentence)
+                )
+                self.active_tasks[task_key] = task
+
+                # Cleanup completed tasks
+                self._cleanup_completed_tasks()
+
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"TTS loop error: {e}", exc_info=True)
+                continue
+
+    async def _generate_sentence_audio(self, sentence: SentenceChunk):
+        """Generate audio for a single sentence with semaphore control"""
+        async with self.generation_semaphore:
+            logger.info(f"🎙️ Generating TTS: {sentence.speaker.name} sentence {sentence.sentence_index}")
+
+            # Build system prompt (simplified - you can enhance with voice configs)
+            system_prompt = (
+                "Generate audio following instruction.\n\n"
+                "<|scene_desc_start|>\n"
+                "Audio is recorded from a quiet room.\n"
+                f"Speaker: {sentence.speaker.name}\n"
+                "<|scene_desc_end|>"
+            )
+
+            # Build messages for Higgs
+            messages = [
+                HiggsMessage(
+                    role="system",
+                    content=system_prompt
+                ),
+                HiggsMessage(
+                    role="user",
+                    content=sentence.text
+                )
+            ]
+
+            audio_token_buffer = []
+            chunk_index = 0
+
+            try:
+                # Generate audio stream
+                streamer = self.serve_engine.generate_delta_stream(
+                    chat_ml_sample=ChatMLSample(messages=messages),
+                    temperature=0.75,
+                    top_p=0.95,
+                    top_k=50,
+                    stop_strings=["<|end_of_text|>", "<|eot_id|>"],
+                    force_audio_gen=True
+                )
+
+                async for delta in streamer:
+                    # Check for interrupt
+                    if self.queues.interrupt_signal.is_set():
+                        logger.warning(f"⚠️ TTS interrupted for {sentence.speaker.name}")
+                        break
+
+                    # Buffer audio tokens
+                    if delta.audio_tokens is not None:
+                        audio_token_buffer.append(delta.audio_tokens)
+
+                        # Emit chunk when buffer full
+                        if len(audio_token_buffer) >= self.chunk_size:
+                            pcm_chunk = await self._process_audio_tokens(
+                                audio_token_buffer[:self.chunk_size]
+                            )
+
+                            if pcm_chunk:
+                                await self._emit_audio_chunk(
+                                    pcm_chunk,
+                                    sentence,
+                                    chunk_index,
+                                    is_final=False
+                                )
+                                chunk_index += 1
+
+                            # Keep overlap for smooth transitions
+                            num_codebooks = delta.audio_tokens.shape[0]
+                            tokens_to_keep = num_codebooks - 1
+                            audio_token_buffer = audio_token_buffer[
+                                self.chunk_size - tokens_to_keep:
+                            ]
+
+                    # Check for end token
+                    if delta.text == "<|eot_id|>":
+                        break
+
+                # Process remaining tokens
+                if audio_token_buffer and not self.queues.interrupt_signal.is_set():
+                    pcm_chunk = await self._process_audio_tokens(audio_token_buffer)
+                    if pcm_chunk:
+                        await self._emit_audio_chunk(
+                            pcm_chunk,
+                            sentence,
+                            chunk_index,
+                            is_final=True
+                        )
+
+                logger.info(f"✅ TTS complete: {sentence.speaker.name} sentence {sentence.sentence_index}")
+
+            except asyncio.CancelledError:
+                logger.warning(f"⚠️ TTS cancelled for {sentence.speaker.name}")
+            except Exception as e:
+                logger.error(f"TTS generation error: {e}", exc_info=True)
+
+    async def _emit_audio_chunk(
+        self,
+        pcm_data: bytes,
+        sentence: SentenceChunk,
+        chunk_index: int,
+        is_final: bool
+    ):
+        """Emit audio chunk to output queue"""
+        audio_chunk = {
+            "data": pcm_data,
+            "sample_rate": self.serve_engine.audio_tokenizer.sampling_rate,
+            "sequence_number": sentence.sequence_number,
+            "sentence_index": sentence.sentence_index,
+            "chunk_index": chunk_index,
+            "is_final": is_final,
+            "speaker_name": sentence.speaker.name,
+            "timestamp": time.time()
+        }
+
+        await self.queues.audio_output.put(audio_chunk)
+        logger.debug(f"Audio chunk emitted: seq={sentence.sequence_number} sent={sentence.sentence_index} chunk={chunk_index}")
+
+    async def _process_audio_tokens(self, tokens):
+        """Convert audio tokens to PCM (run in executor)"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._decode_tokens, tokens)
+
+    def _decode_tokens(self, tokens):
+        """Decode audio tokens to PCM16"""
+        try:
+            audio_chunk = torch.stack(tokens, dim=1)
+            vq_code = revert_delay_pattern(audio_chunk).clip(
+                0, self.serve_engine.audio_codebook_size - 1
+            )
+            waveform = self.serve_engine.audio_tokenizer.decode(
+                vq_code.unsqueeze(0)
+            )[0, 0]
+            pcm_data = (waveform * 32767).astype(np.int16)
+            return pcm_data.tobytes()
+        except Exception as e:
+            logger.error(f"Token decode error: {e}")
+            return None
+
+    async def _cancel_all_tasks(self):
+        """Cancel all active TTS tasks"""
+        logger.info("Cancelling all TTS tasks")
+        for task in self.active_tasks.values():
+            task.cancel()
+        self.active_tasks.clear()
+
+    def _cleanup_completed_tasks(self):
+        """Remove completed tasks from tracking dict"""
+        completed = [k for k, v in self.active_tasks.items() if v.done()]
+        for key in completed:
+            del self.active_tasks[key]
+
     async def shutdown(self):
-        """Clean up TTS resources."""
+        """Clean up TTS resources"""
+        await self._cancel_all_tasks()
         self.is_initialized = False
-        print("TTSService shut down")
-
-
-class Pipeline:
-    """Run TextToAudio pipeline"""
-
-    def __init__(self):
-        self.is_initialized = False
-
-    async def initialize(self):
-        """Initialize the text to audio pipeline."""
-        self.is_initialized = True
-
-    async def start_services(self):
-        """Start all services including audio sequencer"""
-
-        self.pipeline_tasks = [
-            asyncio.create_task(self.stt.run_stt_loop()),
-            asyncio.create_task(self.llm.run_llm_loop()),
-            asyncio.create_task(self.tts.run_tts_loop())
-        ]
-
-    async def run_pipeline_loop(self, audio_data: bytes, stt:STTService, llm: LLMService, tts: TTSService):
-        """continuously runs text to audio stream pipeline"""
-
-        # I'm trying to figure out if should run here or in one of stt / llm loop.
-
-        stt = STTService(config, callbacks)
-        await stt.initialize()
-        
-        # Start listening for voice
-        stt.start_listening()
-        
-        # Feed audio from WebSocket
-        stt.feed_audio(audio_data)
-        
-        # Get final transcription
-        text = await stt.transcribe_audio_message()
+        logger.info("TTSService shut down")
 
 ########################################
 ##--        WebSocket Manager       --##
 ########################################
 
 class WebSocketManager:
-    """Manages WebSocket connections and their associated state."""
-    
+    """Manages WebSocket connections and their associated state"""
+
     def __init__(self):
         self.stt_service: Optional[STTService] = None
         self.llm_service: Optional[LLMService] = None
@@ -768,37 +1372,127 @@ class WebSocketManager:
         self.websocket: Optional[WebSocket] = None
         self.queues: Optional[Queues] = None
 
+        # Track service tasks
+        self.service_tasks: List[asyncio.Task] = []
+
+        # Current character (simplified - can enhance later)
+        self.current_character: Optional[Character] = None
+
     async def initialize(self):
         """Initialize all services with proper callbacks"""
+
+        # Create queues first
+        self.queues = Queues()
+
         # Setup STT callbacks
         stt_callbacks = STTCallbacks(
             on_realtime_update=self.on_realtime_update,
             on_realtime_stabilized=self.on_realtime_stabilized,
             on_final_transcription=self.on_final_transcription,
+            on_vad_start=self.on_vad_start,  # For interrupt detection
         )
-        
-        self.stt_service = STTService(callbacks=stt_callbacks)
-        self.llm_service = LLMService()
-        self.tts_service = TTSService()
-        self.queues = Queues()
 
-        await self.queues.initialize()
+        # Initialize services
+        self.stt_service = STTService(callbacks=stt_callbacks)
+
+        # Get OpenRouter API key
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            logger.error("OPENROUTER_API_KEY environment variable not set!")
+            raise ValueError("OPENROUTER_API_KEY environment variable required")
+
+        self.llm_service = LLMService(
+            api_key=api_key,
+            queues=self.queues
+        )
+        self.tts_service = TTSService(queues=self.queues)
+
+        # Initialize each service
         await self.stt_service.initialize()
         await self.llm_service.initialize()
         await self.tts_service.initialize()
 
+        logger.info("✅ All services initialized")
+
     async def connect(self, websocket: WebSocket):
-        """Accept WebSocket connection"""
+        """Accept WebSocket connection and start service tasks"""
         await websocket.accept()
         self.websocket = websocket
-        logger.info("WebSocket connected")
-    
+
+        # Start service background tasks
+        await self.start_service_tasks()
+
+        logger.info("✅ WebSocket connected and services started")
+
+    async def start_service_tasks(self):
+        """Start background service loops"""
+
+        # STT: Start listening (callback-based, no task needed)
+        if self.stt_service:
+            self.stt_service.start_listening()
+            logger.info("🎤 STT listening started")
+
+        # LLM: Active loop consuming transcription queue
+        if self.llm_service:
+            llm_task = asyncio.create_task(self.llm_service.run_llm_loop())
+            self.service_tasks.append(llm_task)
+            logger.info("🧠 LLM loop task started")
+
+        # TTS: Active loop consuming sentence queue
+        if self.tts_service:
+            tts_task = asyncio.create_task(self.tts_service.run_tts_loop())
+            self.service_tasks.append(tts_task)
+            logger.info("🔊 TTS loop task started")
+
+        # Audio output: Send to WebSocket
+        audio_task = asyncio.create_task(self.audio_output_loop())
+        self.service_tasks.append(audio_task)
+        logger.info("📡 Audio output loop task started")
+
+        # Text output: Send to WebSocket
+        text_task = asyncio.create_task(self.text_output_loop())
+        self.service_tasks.append(text_task)
+        logger.info("💬 Text output loop task started")
+
+        logger.info(f"✅ All {len(self.service_tasks)} service tasks running")
+
     async def disconnect(self):
-        """Handle WebSocket disconnection"""
+        """Handle WebSocket disconnection and cleanup"""
+        logger.info("🔌 Disconnecting WebSocket...")
+
+        # Signal stop
+        if self.queues:
+            self.queues.stop_signal.set()
+
+        # Cancel all service tasks
+        for task in self.service_tasks:
+            task.cancel()
+
+        # Wait for cancellation (with timeout)
+        if self.service_tasks:
+            await asyncio.wait(self.service_tasks, timeout=2.0)
+
+        # Shutdown services
+        if self.stt_service:
+            await self.stt_service.shutdown()
+        if self.llm_service:
+            await self.llm_service.shutdown()
+        if self.tts_service:
+            await self.tts_service.shutdown()
+
+        # Close WebSocket
         if self.websocket:
-            await self.websocket.close()
+            try:
+                await self.websocket.close()
+            except:
+                pass
             self.websocket = None
-        logger.info("WebSocket disconnected")
+
+        logger.info("✅ WebSocket disconnected and services shut down")
+
+    # =========================================================================
+    # Message Handlers
+    # =========================================================================
 
     async def handle_audio_message(self, audio_data: bytes):
         """Feed audio for transcription"""
@@ -811,51 +1505,136 @@ class WebSocketManager:
             data = json.loads(message)
             message_type = data.get("type", "")
             payload = data.get("data", {})
-            
-            if message_type == "user_message":
-                user_message = payload.get("text", "")
-                await self.handle_user_message(user_message)
-            
-            elif message_type == "start_listening":
-                self.stt_service.start_listening()
-            
-            elif message_type == "stop_listening":
-                self.stt_service.stop_listening()
-            
-            elif message_type == "set_model":
-                model = data.get("model", "")
-                self.llm_service.set_model(model)
-                
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
 
-    async def handle_user_message(self, user_message: str):
-        """Process manually sent user message"""
-        await self.queues.transcribed_text.put(user_message)
+            if message_type == "set_character":
+                # Set current character for responses
+                char_data = payload.get("character", {})
+                self.current_character = Character(
+                    id=char_data.get("id", "default"),
+                    name=char_data.get("name", "Assistant"),
+                    voice=char_data.get("voice", ""),
+                    system_prompt=char_data.get("system_prompt", "You are a helpful assistant."),
+                    image_url=char_data.get("image_url", ""),
+                    images=char_data.get("images", []),
+                    is_active=True
+                )
+                self.llm_service.set_character(self.current_character)
+                logger.info(f"Character set: {self.current_character.name}")
+
+            elif message_type == "set_model":
+                model = payload.get("model", "")
+                self.llm_service.set_model(model)
+
+            elif message_type == "start_listening":
+                if self.stt_service:
+                    self.stt_service.start_listening()
+
+            elif message_type == "stop_listening":
+                if self.stt_service:
+                    self.stt_service.stop_listening()
+
+            elif message_type == "interrupt":
+                # User interrupted - stop TTS
+                if self.queues:
+                    self.queues.interrupt_signal.set()
+                logger.info("Interrupt signal set")
+
+        except Exception as e:
+            logger.error(f"Error handling text message: {e}", exc_info=True)
+
+    # =========================================================================
+    # Output Loops (send to WebSocket)
+    # =========================================================================
+
+    async def audio_output_loop(self):
+        """Send audio chunks to WebSocket client"""
+        logger.info("📡 Audio output loop started")
+
+        while not self.queues.stop_signal.is_set():
+            try:
+                audio_chunk = await asyncio.wait_for(
+                    self.queues.audio_output.get(),
+                    timeout=0.1
+                )
+
+                if self.websocket:
+                    # Send binary audio data
+                    await self.websocket.send_bytes(audio_chunk["data"])
+                    logger.debug(f"Sent audio chunk: {len(audio_chunk['data'])} bytes")
+
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Audio output error: {e}", exc_info=True)
+                break
+
+        logger.info("📡 Audio output loop ended")
+
+    async def text_output_loop(self):
+        """Send text chunks to WebSocket client for UI display"""
+        logger.info("💬 Text output loop started")
+
+        while not self.queues.stop_signal.is_set():
+            try:
+                text_chunk: TextChunk = await asyncio.wait_for(
+                    self.queues.text_output.get(),
+                    timeout=0.1
+                )
+
+                if self.websocket:
+                    # Send text chunk as JSON
+                    await self.send_text_message({
+                        "type": "llm_chunk",
+                        "text": text_chunk.text,
+                        "is_final": text_chunk.is_final,
+                        "speaker": text_chunk.speaker_name,
+                        "sequence": text_chunk.sequence_number,
+                        "chunk_index": text_chunk.chunk_index
+                    })
+
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Text output error: {e}", exc_info=True)
+                break
+
+        logger.info("💬 Text output loop ended")
 
     async def send_text_message(self, data: dict):
         """Send JSON message to client"""
         if self.websocket:
-            await self.websocket.send_text(json.dumps(data))
-    
-    async def stream_audio_to_client(self, audio_data: bytes):
-        """Send binary audio to client"""
-        if self.websocket:
-            await self.websocket.send_bytes(audio_data)
+            try:
+                await self.websocket.send_text(json.dumps(data))
+            except Exception as e:
+                logger.error(f"Error sending text message: {e}")
+
+    # =========================================================================
+    # STT Callbacks
+    # =========================================================================
 
     async def on_realtime_update(self, text: str):
+        """Realtime STT update (may change)"""
         await self.send_text_message({"type": "stt_update", "text": text})
-    
+
     async def on_realtime_stabilized(self, text: str):
+        """Realtime STT stabilized (less likely to change)"""
         await self.send_text_message({"type": "stt_stabilized", "text": text})
-    
+
     async def on_final_transcription(self, user_message: str):
-        
-        # put transcribed text into queue for llm to get
+        """Final transcription ready - feed to LLM"""
+        logger.info(f"✅ Final transcription: {user_message}")
+
+        # Put into queue for LLM to consume
         await self.queues.transcribed_text.put(user_message)
 
-        # send final text to client for user's prompt UI display
+        # Send to client for UI display
         await self.send_text_message({"type": "stt_final", "text": user_message})
+
+    async def on_vad_start(self):
+        """Voice activity detected - potentially interrupt TTS"""
+        logger.debug("VAD: Voice detected")
+        # Could trigger interrupt here if desired
+        # self.queues.interrupt_signal.set()
 
 ########################################
 ##--           FastAPI App          --##
@@ -865,13 +1644,13 @@ ws_manager = WebSocketManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting up services...")
+    logger.info("🚀 FastAPI application starting up...")
     await ws_manager.initialize()
-    print("All services initialized!")
+    logger.info("✅ All services initialized!")
     yield
-    print("Shutting down services...")
-    await ws_manager.shutdown()
-    print("All services shut down!")
+    logger.info("🔌 FastAPI application shutting down...")
+    # Services are shut down per-connection in disconnect()
+    logger.info("✅ Shutdown complete!")
 
 app = FastAPI(lifespan=lifespan)
 
