@@ -62,6 +62,15 @@ class Character:
     is_active: bool
 
 @dataclass
+class Voice:
+    voice: str                  
+    method: str
+    speaker_desc: str
+    scene_prompt: str
+    audio_path: str = ""
+    text_path: str = ""
+
+@dataclass
 class ConversationMessage:
     role: str
     name: str
@@ -83,7 +92,6 @@ class SentenceTTS:
     text: str
     speaker: Character
     voice: Optional[Voice]
-    speaker_number: int
     sentence_index: int
     is_final: bool
     timestamp: float = field(default_factory=time.time)
@@ -91,9 +99,8 @@ class SentenceTTS:
 @dataclass 
 class TextChunk:
     text: str
-    character_id: str
+    message_id: str
     character_name: str
-    speaker_number: int
     chunk_index: int
     is_final: bool
     timestamp: float
@@ -133,20 +140,6 @@ class STTCallbacks:
     on_turn_end: Optional[Callable[[], Any]] = None
 
 ########################################
-##--           Functions            --##
-########################################
-
-class Functions:
-    """Functions for various pipeline stages"""
-
-    def __init__(self):
-        pass
-
-
-
-
-
-########################################
 ##--             Queues             --##
 ########################################
 
@@ -164,49 +157,6 @@ class Queues:
         self.tts_sentence_queue = asyncio.Queue()
 
         self.audio_queue = asyncio.Queue()
-
-
-
-class CharacterResponse:
-    """
-    Manages the complete streaming pipeline for a single character response.
-    
-    Flow:
-    1. Starts LLM generation
-    2. Streams text chunks to UI queue AND sentence extractor
-    3. Sentences are queued for TTS as soon as detected
-    4. Tracks completion and handles cleanup
-    
-    This is instantiated once per character response within LLMOrchestrator.
-    """
-    
-    def __init__(
-        self,
-        character: Character,
-        voice: Optional[Voice],
-        speaker_number: int,
-        text_output_queue: asyncio.Queue,
-        tts_request_queue: asyncio.Queue,
-        interrupt_signal: asyncio.Event,
-    ):
-        self.character = character
-        self.voice = voice
-        self.speaker_number = speaker_number
-        self.text_output_queue = text_output_queue
-        self.tts_request_queue = tts_request_queue
-        self.interrupt_signal = interrupt_signal
-        
-        # Sentence streamer
-        self.sentence_extractor = TextToSentence()
-        
-        # Tracking
-        self.chunk_index = 0
-        self.sentence_index = 0
-        self.total_text = ""
-        self.is_complete = False
-    
-
-
 
 ########################################
 ##--           STT Service          --##
@@ -519,7 +469,6 @@ class TextToSentence:
             self.sentences_thread.join(timeout=1.0)
         self._executor.shutdown(wait=False)
 
-
 ########################################
 ##--           LLM Service          --##
 ########################################
@@ -570,7 +519,7 @@ class LLMService:
             content=text
         ))
 
-    def add_message_to_conversation_history(self, role = str, name = str, content = str):
+    def add_message_to_conversation_history(self, role: str, name: str, content: str):
         """Add (user or character) message to conversation history"""
         self.conversation_history.append(ConversationMessage(
             role=role,
@@ -584,7 +533,6 @@ class LLMService:
             'role': 'system',
             'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else. Wrap your entire response in <{character.name}></{character.name}> tags.'
         }
-
 
     def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
         """Parse a message for character mentions in order of appearance"""
@@ -622,14 +570,18 @@ class LLMService:
 
         # function that has model and model parameters for the message we are about to send.
 
-    def build_character_message_request(self, user_message: str):
+    def build_character_message_request(self, user_message: str, character:Character):
         """Build LLM prompt for a specific character."""
 
         # build entire message body to send to openrouter - user_message, model with settings
 
+        messages = []
+
+        # Add character's system prompt
+        
 
 
-    async def main_llm_loop(self):
+    async def main_llm_loop(self, model_settings: ModelSettings):
         """Run LLM loop"""
 
         while True:
@@ -641,86 +593,50 @@ class LLMService:
                     continue
 
                 # Add user message to conversation history
-                self.conversation_history.append({
-                    "role": "user",
-                    "name": "Jay",
-                    "content": user_message
-                })
+                self.conversation_history.append({"role": "user", "name": "Jay", "content": user_message})
 
-                response_text = await self.character_response_stream(text_stream)
+                # Parse which characters should respond
+                mentioned_characters = self.parse_character_mentions(user_message, self.active_characters)
+
+                for character in mentioned_characters:
+                    if self.queues.interrupt_signal.is_set():
+                        break
+
+                    messages = []
+
+                    messages.append({"role": "system", "name": character.name, "content": character.system_prompt})
+
+                    messages.extend(self.conversation_history)
+
+                    # Add character instruction message at the end
+                    messages.append(self.create_character_instruction_message(character))
+
+                    text_stream = await self.client.chat.completions.create({
+                        "model": model_settings.model,
+                        "messages": messages,
+                        "temperature": model_settings.temperature,
+                        "top_p": model_settings.top_p,
+                        "min_p": model_settings.min_p,
+                        "top_k": model_settings.top_k,
+                        "frequency_penalty": model_settings.frequency_penalty,
+                        "presence_penalty": model_settings.presence_penalty,
+                        "repetition_penalty": model_settings.repetition_penalty,
+                        "stream":True
+                    })
+
+                    # Generate responses for each character in sequence
+                    response_text = await self.character_response_stream(self, character=character, text_stream=text_stream)
+
+                    # add response to conversation history
+                    if response_text: 
+                        self.add_message_to_conversation_history("assistant", character.name, response_text)
                 
             except Exception as e:
                 logger.error(f"Error in LLM loop: {e}")
 
 
-    async def _orchestrate_streaming_responses(
-        self,
-        context,  # ConversationContext
-        mentioned_characters: List[Character]
-    ):
-        """
-        Orchestrate response for each character in order.
-        
-        """
-        for character in mentioned_characters:
-            if self.queues.interrupt_signal.is_set():
-                break
-            
-            await self._generate_streaming_response(context, character)
-    
-    async def _generate_streaming_response(
-        self,
-        context,
-        character: Character,
-        sequence_number: int
-    ):
-        """Generate streaming response with real-time sentence extraction"""
-        
-        print(f"🎭 Generating streaming response for {character.name} (seq {sequence_number})")
-        
-        # Get cached voice (no async DB call!)
-        voice = self.get_voice(character)
-        
-        # Build prompt
-        messages = self.character_service.build_character_prompt(
-            character,
-            context.history
-        )
-        
-        try:
-            # Create LLM stream
-            text_stream = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True
-            )
-            
-            # Create response streamer
-            streamer = LLMResponseStreamer(
-                character=character,
-                voice=voice,
-                sequence_number=sequence_number,
-                text_output_queue=self.queues.text_output,
-                tts_request_queue=self.queues.tts_requests,
-                interrupt_signal=self.queues.interrupt_signal,
-            )
-            
-            # Process stream - sentences are queued for TTS as detected
-            response_text = await streamer.stream_response(stream)
-            
-            # Add to conversation history
-            context.add_character_message(character, response_text)
-            
-            
-            print(f"✓ {character.name} streaming complete ({streamer.sentence_index + 1} sentences)")
-            
-        except Exception as e:
-            print(f"Error generating response for {character.name}: {e}")
-
-
-
     async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
-        """Process LLM text stream, extract sentences, queue sentences for TTS."""
+        """Generate and stream a single character's response"""
 
         self.sentence_extractor.start()
         
@@ -745,9 +661,9 @@ class LLMService:
                     # Stream to UI immediately
                     display_text = TextChunk(
                         text=content,
-                        chunk_index=self.chunk_index,
-                        character_id=self.character.id,
+                        message_id=self.message.id,
                         character_name=self.character.name,
+                        chunk_index=self.chunk_index,
                         is_final=False,
                         timestamp=time.time()
                     )
@@ -760,9 +676,9 @@ class LLMService:
             # Send final text chunk to UI
             final_display_text = TextChunk(
                 text="",
-                chunk_index=self.chunk_index,
-                character_id=self.character.id,
+                message_id=self.message.id,
                 character_name=self.character.name,
+                chunk_index=self.chunk_index,
                 is_final=False,
                 timestamp=time.time()
             )
@@ -786,30 +702,29 @@ class LLMService:
         sentences_queued = []
         
         try:
-            async for sentence, index in self.sentence_extractor.get_sentences():
+            async for sentence, sentence_index in self.sentence_extractor.get_sentences():
                 if self.interrupt_signal.is_set():
                     break
-                
+
+                sentence_index = 0
                 sentences_queued.append(sentence)
-                self.sentence_index = index
                 
                 # Determine if this might be the last sentence
                 # (We don't know for sure until sentence streamer finishes)
                 is_final = False  # Will be corrected below
                 
                 # Queue for TTS immediately
-                sentence_chunk = SentenceTTS(
+                sentence = SentenceTTS(
                     text=sentence,
                     speaker=self.character,
                     voice=self.voice,
-                    speaker_number=self.speaker_number,
-                    sentence_index=index,
+                    sentence_index=sentence_index,
                     is_final=is_final,
                     timestamp=time.time()
                 )
-                await self.tts_sentence_queue.put(sentence_chunk)
+                await self.tts_sentence_queue.put(sentence)
                 
-                print(f"📝 Sentence {index} queued for TTS ({self.character.name}): "
+                print(f"📝 Sentence {sentence_index} queued for TTS ({self.character.name}): "
                       f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
             
             # Mark the last sentence as final
@@ -819,7 +734,6 @@ class LLMService:
                     text="",  # Empty text signals completion
                     speaker=self.character,
                     voice=self.voice,
-                    speaker_number=self.speaker_number,
                     sentence_index=self.sentence_index + 1,
                     is_final=True,
                     timestamp=time.time()
@@ -828,9 +742,6 @@ class LLMService:
                 
         except Exception as e:
             print(f"Error processing sentences for {self.character.name}: {e}")
-
-
-
 
 
 
