@@ -347,9 +347,10 @@ class TextToSentence:
         # Thread-safe components
         self.char_iter: Optional[CharIterator] = None
         self.thread_safe_iter: Optional[AccumulatingThreadSafeGenerator] = None
-        
+
         # Sentence output queue (thread-safe)
-        
+        self.sentence_queue = Queue()
+
         # Control
         self.sentences_thread: Optional[threading.Thread] = None
         self._is_running = False
