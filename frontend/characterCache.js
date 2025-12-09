@@ -115,18 +115,68 @@ class CharacterCache {
   }
 
   /**
+   * Generate a unique character ID based on name
+   * Format: lowercase-name-###
+   * Example: "Jenna Haze" -> "jenna-haze-001"
+   * @param {string} name - Character name
+   * @returns {string} Generated ID
+   */
+  generateCharacterId(name) {
+    // Convert to lowercase, replace spaces/special chars with dashes
+    const baseName = name
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+
+    // Find existing characters with the same base name
+    const existingIds = Array.from(this.characters.keys())
+      .filter(id => id.startsWith(baseName + '-'))
+      .sort();
+
+    // If no existing characters with this base name, use -001
+    if (existingIds.length === 0) {
+      return `${baseName}-001`;
+    }
+
+    // Extract numbers from existing IDs and find the highest
+    const numbers = existingIds.map(id => {
+      const match = id.match(/-(\d{3})$/);
+      return match ? parseInt(match[1], 10) : 0;
+    });
+
+    const maxNumber = Math.max(...numbers);
+    const nextNumber = (maxNumber + 1).toString().padStart(3, '0');
+
+    return `${baseName}-${nextNumber}`;
+  }
+
+  /**
    * Create a new character (optimistic update + background sync)
    * @param {Object} characterData - Character data (without ID)
-   * @returns {Promise<Object>} Created character with server-generated ID
+   * @returns {Promise<Object>} Created character with generated ID
    */
   async createCharacter(characterData) {
     console.log('Creating character:', characterData.name);
 
     try {
+      // Generate ID based on character name
+      const id = this.generateCharacterId(characterData.name);
+
+      // Add ID to character data
+      const dataWithId = {
+        ...characterData,
+        id: id
+      };
+
+      console.log('Generated ID:', id);
+
       // Create in database
       const { data, error } = await supabase
         .from(TABLES.CHARACTERS)
-        .insert([characterData])
+        .insert([dataWithId])
         .select()
         .single();
 
