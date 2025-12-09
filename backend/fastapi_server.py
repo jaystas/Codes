@@ -51,8 +51,8 @@ logger.setLevel(logging.INFO)
 
 sys.path.append('/workspace/tts/Code')
 
-@dataclass
-class Character:
+
+class Character(BaseModel):
     id: str
     name: str
     voice: str = ""
@@ -348,7 +348,6 @@ class TextToSentence:
         self.thread_safe_iter: Optional[AccumulatingThreadSafeGenerator] = None
         
         # Sentence output queue (thread-safe)
-        self.sentence_queue = Queues.sentence_queue
         
         # Control
         self.sentences_thread: Optional[threading.Thread] = None
@@ -779,14 +778,9 @@ class WebSocketManager:
             on_final_transcription=self.on_final_transcription,
         )
         
-        self.stt_service = STTService(callbacks=stt_callbacks)
-        self.llm_service = LLMService()
+        self.stt_service = STTService()
+        self.llm_service = LLMService(character=Character, queues=Queues, api_key=str, model=str)
         self.tts_service = TTSService()
-
-        await self.queues.initialize()
-        await self.stt_service.initialize()
-        await self.llm_service.initialize()
-        await self.tts_service.initialize()
 
     async def connect(self, websocket: WebSocket):
         """Accept WebSocket connection"""
