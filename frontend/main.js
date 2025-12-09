@@ -9,6 +9,12 @@ import { initEditor, handleMic, handleSend } from './editor.js';
 // Import characters functions
 import { initCharacters } from './characters.js';
 
+// Import chat manager
+import { chat } from './chat.js';
+
+// Import websocket
+import { websocket } from './websocket.js';
+
 // Make functions globally accessible for inline event handlers
 window.handleMic = handleMic;
 window.handleSend = handleSend;
@@ -584,6 +590,10 @@ function loadPage(page, container) {
         initEditor();
         initDrawer();
         initInfoDrawer();
+
+        // Initialize chat and connect websocket
+        chat.initialize();
+        websocket.connect();
       }, 100);
     }
 
