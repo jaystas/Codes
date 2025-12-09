@@ -474,26 +474,33 @@ class TextToSentence:
 ########################################
 
 class LLMService:
-    """LLM Service"""
+    """LLM Service for multi-character conversation loop"""
 
-    def __init__(self, character: Character, queues: Queues, api_key: str, model: str):
-        
+    def __init__(self, queues: Queues, api_key: str):
+
         self.is_initialized = False
         self.queues = queues
         self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-        self.model = model
 
-        self.conversation_history: List[Message] = []
-        self.character: Optional[Character] = None
-        self.speaker_number = 0
+        # Active characters in the conversation
+        self.active_characters: List[Character] = []
 
-        self.sentence_extractor = TextToSentence()
-        
-        # Tracking
+        # Conversation history - shared across all characters
+        # Format: List of dicts with role, name, content
+        self.conversation_history: List[Dict[str, str]] = []
+
+        # Current model settings (can be updated per request)
+        self.model_settings: Optional[ModelSettings] = None
+
+        # Per-response tracking (reset for each character response)
+        self.sentence_extractor: Optional[TextToSentence] = None
         self.chunk_index = 0
         self.sentence_index = 0
         self.response_text = ""
         self.is_complete = False
+
+        # Interrupt handling
+        self.interrupt_event = asyncio.Event()
 
     async def initialize(self):
         self.is_initialized = True
@@ -503,29 +510,48 @@ class LLMService:
         """Strip character tags from text for display/TTS purposes"""
         return re.sub(r'<[^>]+>', '', text).strip()
 
-    def add_user_message(self, name: str = "Jay", content = "user_message"):
-        """Add user message to history"""
-        self.conversation_history.append(content(
-            role="user",
-            name=name,
-            content="user_message",
-        ))
+    def add_user_message(self, content: str, name: str = "User"):
+        """Add user message to conversation history"""
+        self.conversation_history.append({
+            "role": "user",
+            "name": name,
+            "content": content
+        })
 
-    def add_character_message(self, character: Character, text: str):
-        """Add character response to history"""
-        self.conversation_history.append(ConversationMessage(
-            role="assistant",
-            name=character.name,
-            content=text
-        ))
+    def add_character_message(self, character: Character, content: str):
+        """Add character response to conversation history"""
+        self.conversation_history.append({
+            "role": "assistant",
+            "name": character.name,
+            "content": content
+        })
 
     def add_message_to_conversation_history(self, role: str, name: str, content: str):
         """Add (user or character) message to conversation history"""
-        self.conversation_history.append(ConversationMessage(
-            role=role,
-            name=name,
-            content=content
-        ))
+        self.conversation_history.append({
+            "role": role,
+            "name": name,
+            "content": content
+        })
+
+    def set_active_characters(self, characters: List[Character]):
+        """Set the active characters for the conversation"""
+        self.active_characters = characters
+
+    def set_model_settings(self, model_settings: ModelSettings):
+        """Set model settings for LLM requests"""
+        self.model_settings = model_settings
+
+    def clear_conversation_history(self):
+        """Clear the conversation history"""
+        self.conversation_history = []
+
+    def reset_response_tracking(self):
+        """Reset per-response tracking variables"""
+        self.chunk_index = 0
+        self.sentence_index = 0
+        self.response_text = ""
+        self.is_complete = False
 
     def create_character_instruction_message(self, character: Character) -> Dict[str, str]:
         """Create character instruction message for group chat with character tags."""
@@ -565,183 +591,314 @@ class LLMService:
 
         return mentioned_characters
     
-    def get_model_settings(self):
-        """Get model with parameters from client message"""
+    def get_model_settings(self) -> ModelSettings:
+        """Get current model settings for the LLM request"""
+        if self.model_settings is None:
+            # Return default settings if not set
+            return ModelSettings(
+                model="meta-llama/llama-3.1-8b-instruct",
+                temperature=0.7,
+                top_p=0.9,
+                min_p=0.0,
+                top_k=40,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                repetition_penalty=1.0
+            )
+        return self.model_settings
 
-        # function that has model and model parameters for the message we are about to send.
+    def build_character_message_array(self, character: Character, is_multi_character: bool = True) -> List[Dict[str, str]]:
+        """
+        Build the message array for a specific character's LLM request.
 
-    def build_character_message_request(self, user_message: str, character:Character):
-        """Build LLM prompt for a specific character."""
+        Message array structure:
+        1. System prompt (character-specific) - at the beginning
+        2. Conversation history (user and assistant messages)
+        3. Instruction message (for multi-character chats) - at the end
 
-        # build entire message body to send to openrouter - user_message, model with settings
+        Args:
+            character: The character to build the message array for
+            is_multi_character: Whether this is a multi-character conversation
 
+        Returns:
+            List of message dicts ready for OpenRouter API
+        """
         messages = []
 
-        # Add character's system prompt
-        
+        # 1. Add character's system prompt at the beginning
+        messages.append({
+            "role": "system",
+            "content": character.system_prompt
+        })
+
+        # 2. Add conversation history (all user and assistant messages)
+        # The conversation history already contains all messages in order
+        for msg in self.conversation_history:
+            # Format message for API - include name in content for context
+            if msg.get("name"):
+                if msg["role"] == "user":
+                    messages.append({
+                        "role": "user",
+                        "content": f'{msg["name"]}: {msg["content"]}'
+                    })
+                else:  # assistant
+                    messages.append({
+                        "role": "assistant",
+                        "content": f'<{msg["name"]}>{msg["content"]}</{msg["name"]}>'
+                    })
+            else:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+
+        # 3. Add instruction message at the end (for multi-character chats)
+        if is_multi_character and len(self.active_characters) > 1:
+            messages.append(self.create_character_instruction_message(character))
+
+        return messages
 
 
-    async def main_llm_loop(self, model_settings: ModelSettings):
-        """Run LLM loop"""
+    async def main_llm_loop(self):
+        """
+        Main LLM conversation loop for multi-character conversations.
+
+        Flow:
+        1. Wait for user message from transcription queue
+        2. Add user message to conversation history
+        3. Parse which characters should respond (based on mentions)
+        4. For each responding character:
+           a. Build message array (system prompt + history + instruction)
+           b. Stream LLM response
+           c. Add character response to conversation history
+           d. Next character sees previous character's response
+        5. Repeat
+        """
+        logger.info("Starting main LLM loop")
 
         while True:
             try:
-
+                # Wait for user message from transcription queue
                 user_message = await self.queues.transcribed_text.get()
-                
+
                 if not user_message or not user_message.strip():
                     continue
 
+                logger.info(f"Processing user message: {user_message[:50]}...")
+
                 # Add user message to conversation history
-                self.conversation_history.append({"role": "user", "name": "Jay", "content": user_message})
+                self.add_user_message(content=user_message, name="User")
 
-                # Parse which characters should respond
-                mentioned_characters = self.parse_character_mentions(user_message, self.active_characters)
+                # Parse which characters should respond based on mentions
+                # Returns characters in order of mention
+                responding_characters = self.parse_character_mentions(
+                    message=user_message,
+                    active_characters=self.active_characters
+                )
 
-                for character in mentioned_characters:
-                    if self.queues.interrupt_signal.is_set():
+                logger.info(f"Characters responding: {[c.name for c in responding_characters]}")
+
+                # Determine if this is a multi-character conversation
+                is_multi_character = len(self.active_characters) > 1
+
+                # Generate responses for each character in sequence
+                for character in responding_characters:
+                    # Check for interrupt
+                    if self.interrupt_event.is_set():
+                        logger.info("Interrupt detected, stopping character responses")
+                        self.interrupt_event.clear()
                         break
 
-                    messages = []
+                    # Reset per-response tracking
+                    self.reset_response_tracking()
 
-                    messages.append({"role": "system", "name": character.name, "content": character.system_prompt})
+                    # Build message array for this character
+                    # Each subsequent character sees previous character's responses
+                    messages = self.build_character_message_array(
+                        character=character,
+                        is_multi_character=is_multi_character
+                    )
 
-                    messages.extend(self.conversation_history)
+                    logger.info(f"Generating response for {character.name} with {len(messages)} messages")
 
-                    # Add character instruction message at the end
-                    messages.append(self.create_character_instruction_message(character))
+                    # Get model settings
+                    settings = self.get_model_settings()
 
-                    text_stream = await self.client.chat.completions.create({
-                        "model": model_settings.model,
-                        "messages": messages,
-                        "temperature": model_settings.temperature,
-                        "top_p": model_settings.top_p,
-                        "min_p": model_settings.min_p,
-                        "top_k": model_settings.top_k,
-                        "frequency_penalty": model_settings.frequency_penalty,
-                        "presence_penalty": model_settings.presence_penalty,
-                        "repetition_penalty": model_settings.repetition_penalty,
-                        "stream":True
-                    })
+                    # Create streaming completion request
+                    text_stream = await self.client.chat.completions.create(
+                        model=settings.model,
+                        messages=messages,
+                        temperature=settings.temperature,
+                        top_p=settings.top_p,
+                        frequency_penalty=settings.frequency_penalty,
+                        presence_penalty=settings.presence_penalty,
+                        stream=True,
+                        extra_body={
+                            "min_p": settings.min_p,
+                            "top_k": settings.top_k,
+                            "repetition_penalty": settings.repetition_penalty
+                        }
+                    )
 
-                    # Generate responses for each character in sequence
-                    response_text = await self.character_response_stream(self, character=character, text_stream=text_stream)
+                    # Stream and process the response
+                    response_text = await self.character_response_stream(
+                        character=character,
+                        text_stream=text_stream
+                    )
 
-                    # add response to conversation history
-                    if response_text: 
-                        self.add_message_to_conversation_history("assistant", character.name, response_text)
-                
+                    # Add character's response to conversation history
+                    # This way the next character will see this response
+                    if response_text:
+                        # Strip character tags from response before adding to history
+                        clean_response = self.strip_character_tags(response_text)
+                        self.add_character_message(character=character, content=clean_response)
+                        logger.info(f"Added {character.name}'s response to history ({len(clean_response)} chars)")
+
+            except asyncio.CancelledError:
+                logger.info("LLM loop cancelled")
+                break
             except Exception as e:
-                logger.error(f"Error in LLM loop: {e}")
+                logger.error(f"Error in LLM loop: {e}", exc_info=True)
 
 
     async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
-        """Generate and stream a single character's response"""
+        """
+        Generate and stream a single character's response.
 
+        Handles:
+        - Streaming text chunks from LLM
+        - Feeding text to sentence extractor for TTS
+        - Sending text chunks to UI queue
+        - Accumulating full response text
+
+        Args:
+            character: The character whose response is being generated
+            text_stream: Async iterator of LLM response chunks
+
+        Returns:
+            The complete response text
+        """
+        # Generate unique message ID for this response
+        message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
+
+        # Create new sentence extractor for this response
+        self.sentence_extractor = TextToSentence()
         self.sentence_extractor.start()
-        
+
+        # Store current character for sentence processing
+        self._current_character = character
+        self._current_message_id = message_id
+
         # Create task for sentence-to-TTS processing
-        sentence_task = asyncio.create_task(self.process_sentences_for_tts())
-        
+        sentence_task = asyncio.create_task(
+            self.process_sentences_for_tts(character=character, message_id=message_id)
+        )
+
         try:
             # Stream from LLM
             async for chunk in text_stream:
                 # Check for interrupt
-                if self.interrupt_signal.is_set():
+                if self.interrupt_event.is_set():
+                    logger.info(f"Interrupt detected during {character.name}'s response")
                     break
-                
+
                 # Extract content from chunk
-                content = chunk.choices[0].delta.content
-                if content:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
                     self.response_text += content
-                    
+
                     # Feed to sentence extractor (non-blocking)
                     self.sentence_extractor.feed_text(content)
-                    
+
                     # Stream to UI immediately
-                    display_text = TextChunk(
+                    text_chunk = TextChunk(
                         text=content,
-                        message_id=self.message.id,
-                        character_name=self.character.name,
+                        message_id=message_id,
+                        character_name=character.name,
                         chunk_index=self.chunk_index,
                         is_final=False,
                         timestamp=time.time()
                     )
-                    await self.text_queue.put(display_text)
+                    await self.queues.text_queue.put(text_chunk)
                     self.chunk_index += 1
-            
+
             # Signal LLM stream complete
             self.sentence_extractor.finish()
-            
+
             # Send final text chunk to UI
-            final_display_text = TextChunk(
+            final_text_chunk = TextChunk(
                 text="",
-                message_id=self.message.id,
-                character_name=self.character.name,
+                message_id=message_id,
+                character_name=character.name,
                 chunk_index=self.chunk_index,
-                is_final=False,
+                is_final=True,
                 timestamp=time.time()
             )
-            await self.text_queue.put(final_display_text)
-            
+            await self.queues.text_queue.put(final_text_chunk)
+
             # Wait for sentence processing to complete
             await sentence_task
-            
+
         except Exception as e:
-            print(f"Error in stream_response for {self.character.name}: {e}")
+            logger.error(f"Error in character_response_stream for {character.name}: {e}")
             raise
         finally:
-            self.sentence_extractor.shutdown()
+            if self.sentence_extractor:
+                self.sentence_extractor.shutdown()
             self.is_complete = True
-        
-        return self.response_text
-    
-    async def process_sentences_for_tts(self):
-        """Process sentences as they're extracted and queue for TTS. Runs concurrently with LLM text stream."""
 
+        return self.response_text
+
+    async def process_sentences_for_tts(self, character: Character, message_id: str):
+        """
+        Process sentences as they're extracted and queue for TTS.
+        Runs concurrently with LLM text stream.
+
+        Args:
+            character: The character whose sentences are being processed
+            message_id: Unique ID for the current message
+        """
         sentences_queued = []
-        
+        sentence_idx = 0
+
         try:
-            async for sentence, sentence_index in self.sentence_extractor.get_sentences():
-                if self.interrupt_signal.is_set():
+            async for sentence_text, _ in self.sentence_extractor.get_sentences():
+                # Check for interrupt
+                if self.interrupt_event.is_set():
                     break
 
-                sentence_index = 0
-                sentences_queued.append(sentence)
-                
-                # Determine if this might be the last sentence
-                # (We don't know for sure until sentence streamer finishes)
-                is_final = False  # Will be corrected below
-                
+                sentences_queued.append(sentence_text)
+
                 # Queue for TTS immediately
-                sentence = SentenceTTS(
-                    text=sentence,
-                    speaker=self.character,
-                    voice=self.voice,
-                    sentence_index=sentence_index,
-                    is_final=is_final,
+                sentence_tts = SentenceTTS(
+                    text=sentence_text,
+                    speaker=character,
+                    voice=None,  # Voice will be resolved by TTS service
+                    sentence_index=sentence_idx,
+                    is_final=False,
                     timestamp=time.time()
                 )
-                await self.tts_sentence_queue.put(sentence)
-                
-                print(f"📝 Sentence {sentence_index} queued for TTS ({self.character.name}): "
-                      f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
-            
-            # Mark the last sentence as final
+                await self.queues.tts_sentence_queue.put(sentence_tts)
+
+                logger.info(f"Sentence {sentence_idx} queued for TTS ({character.name}): "
+                           f"{sentence_text[:50]}{'...' if len(sentence_text) > 50 else ''}")
+
+                sentence_idx += 1
+
+            # Send final marker for this character's TTS
             if sentences_queued:
-                # Send a "final" marker for this character's TTS
                 final_marker = SentenceTTS(
                     text="",  # Empty text signals completion
-                    speaker=self.character,
-                    voice=self.voice,
-                    sentence_index=self.sentence_index + 1,
+                    speaker=character,
+                    voice=None,
+                    sentence_index=sentence_idx,
                     is_final=True,
                     timestamp=time.time()
                 )
-                await self.tts_sentence_queue.put(final_marker)
-                
+                await self.queues.tts_sentence_queue.put(final_marker)
+
         except Exception as e:
-            print(f"Error processing sentences for {self.character.name}: {e}")
+            logger.error(f"Error processing sentences for {character.name}: {e}")
 
 ########################################
 ##--           TTS Service          --##
@@ -916,6 +1073,9 @@ class WebSocketManager:
         self.queues: Optional[Queues] = None
         self.service_tasks: List[asyncio.Task] = []
 
+        # API key from environment
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
+
     async def initialize(self):
         """Initialize all services with proper callbacks"""
 
@@ -928,12 +1088,22 @@ class WebSocketManager:
             on_final_transcription=self.on_final_transcription,
         )
 
+        # Initialize STT service
         self.stt_service = STTService()
-        self.llm_service = LLMService(character=Character, queues=Queues, api_key=str, model=str)
+        self.stt_service.callbacks = stt_callbacks
+
+        # Initialize LLM service with queues and API key
+        self.llm_service = LLMService(
+            queues=self.queues,
+            api_key=self.openrouter_api_key
+        )
+        await self.llm_service.initialize()
 
         # Initialize TTS Service Manager with queues
         self.tts_service = TTSServiceManager(queues=self.queues)
         await self.tts_service.initialize()
+
+        logger.info("WebSocketManager initialized")
 
     async def connect(self, websocket: WebSocket):
         """Accept WebSocket connection"""
@@ -984,28 +1154,77 @@ class WebSocketManager:
             self.stt_service.feed_audio(audio_data)
 
     async def handle_text_message(self, message: str):
-        """Handle incoming text messages"""
+        """Handle incoming text messages from WebSocket client"""
         try:
             data = json.loads(message)
             message_type = data.get("type", "")
             payload = data.get("data", {})
-            
+
             if message_type == "user_message":
+                # Handle user text message
                 user_message = payload.get("text", "")
                 await self.handle_user_message(user_message)
-            
+
             elif message_type == "start_listening":
-                self.stt_service.start_listening()
-            
+                # Start STT listening
+                if self.stt_service:
+                    self.stt_service.start_listening()
+
             elif message_type == "stop_listening":
-                self.stt_service.stop_listening()
+                # Stop STT listening
+                if self.stt_service:
+                    self.stt_service.stop_listening()
 
             elif message_type == "model_settings":
-                model_settings = data.get("model", "")
-                # need to add all model parameters (temperature, top_p, min_p, top_k, frequency_penalty, presense_penalty, repetition_penalty)
-                
+                # Update model settings for LLM
+                settings_data = payload
+                model_settings = ModelSettings(
+                    model=settings_data.get("model", "meta-llama/llama-3.1-8b-instruct"),
+                    temperature=float(settings_data.get("temperature", 0.7)),
+                    top_p=float(settings_data.get("top_p", 0.9)),
+                    min_p=float(settings_data.get("min_p", 0.0)),
+                    top_k=int(settings_data.get("top_k", 40)),
+                    frequency_penalty=float(settings_data.get("frequency_penalty", 0.0)),
+                    presence_penalty=float(settings_data.get("presence_penalty", 0.0)),
+                    repetition_penalty=float(settings_data.get("repetition_penalty", 1.0))
+                )
+                if self.llm_service:
+                    self.llm_service.set_model_settings(model_settings)
+                logger.info(f"Model settings updated: {model_settings.model}")
+
+            elif message_type == "set_characters":
+                # Set active characters for the conversation
+                characters_data = payload.get("characters", [])
+                characters = [
+                    Character(
+                        id=char.get("id", str(uuid.uuid4())),
+                        name=char.get("name", ""),
+                        voice=char.get("voice", ""),
+                        system_prompt=char.get("system_prompt", ""),
+                        image_url=char.get("image_url", ""),
+                        images=char.get("images", []),
+                        is_active=char.get("is_active", True)
+                    )
+                    for char in characters_data
+                ]
+                if self.llm_service:
+                    self.llm_service.set_active_characters(characters)
+                logger.info(f"Active characters set: {[c.name for c in characters]}")
+
+            elif message_type == "clear_history":
+                # Clear conversation history
+                if self.llm_service:
+                    self.llm_service.clear_conversation_history()
+                logger.info("Conversation history cleared")
+
+            elif message_type == "interrupt":
+                # Signal interrupt to stop current generation
+                if self.llm_service:
+                    self.llm_service.interrupt_event.set()
+                logger.info("Interrupt signal sent")
+
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"Error handling message: {e}", exc_info=True)
 
     async def handle_user_message(self, user_message: str):
         """Process manually sent user message"""
