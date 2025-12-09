@@ -1,13 +1,15 @@
 /**
  * characters.js - Character Management Functionality
  * Handles character creation, editing, deletion, and display
- * Now using Supabase JS client directly for low-latency access
+ * Now using character cache and real-time sync for instant access
  */
 
-// Import Supabase client
-import { supabase, TABLES, handleSupabaseError, logError } from './supabase.js';
+// Import cache and real-time sync
+import { characterCache } from './characterCache.js';
+import { realtimeSync } from './realtimeSync.js';
+import { handleSupabaseError } from './supabase.js';
 
-// Character data storage
+// Character data storage (populated from cache)
 let characters = [];
 let voices = [];
 let selectedCharacterId = null;
@@ -24,39 +26,41 @@ export async function initCharacters() {
   // Setup event listeners
   setupEventListeners();
 
-  // Load data from Supabase
+  // Setup real-time sync event handlers
+  setupRealtimeSyncHandlers();
+
+  // Load data from cache (and initialize if needed)
   await loadData();
 
-  console.log('Characters page initialized');
+  // Start real-time sync
+  realtimeSync.start();
+
+  console.log('Characters page initialized with cache and real-time sync');
 }
 
 /**
- * Load all data from Supabase (characters and voices)
+ * Load all data from cache (instant access after initialization)
  */
 async function loadData() {
   isLoading = true;
   showLoadingState();
 
   try {
-    // Load characters and voices in parallel using Supabase
-    const [charactersResult, voicesResult] = await Promise.all([
-      supabase.from(TABLES.CHARACTERS).select('*').order('created_at', { ascending: false }),
-      supabase.from(TABLES.VOICES).select('*').order('created_at', { ascending: false }),
-    ]);
-
-    // Handle characters result
-    if (charactersResult.error) {
-      throw charactersResult.error;
+    // Initialize cache if not already done (loads from database on first call)
+    if (!characterCache.isInitialized) {
+      console.log('Initializing cache from database...');
+      const data = await characterCache.initialize();
+      characters = data.characters;
+      voices = data.voices;
+      console.log(`✅ Cache initialized: ${characters.length} characters, ${voices.length} voices`);
+    } else {
+      // Get from cache (instant!)
+      console.log('Loading from cache (instant)...');
+      const data = characterCache.getAll();
+      characters = data.characters;
+      voices = data.voices;
+      console.log(`✅ Loaded from cache: ${characters.length} characters, ${voices.length} voices`);
     }
-    characters = charactersResult.data || [];
-
-    // Handle voices result
-    if (voicesResult.error) {
-      throw voicesResult.error;
-    }
-    voices = voicesResult.data || [];
-
-    console.log(`Loaded ${characters.length} characters and ${voices.length} voices from Supabase`);
 
     // Render the character list
     renderCharacterList();
@@ -65,7 +69,6 @@ async function loadData() {
     populateVoiceDropdown();
   } catch (error) {
     console.error('Error loading data:', error);
-    logError('loadData', error);
     const errorMessage = handleSupabaseError(error);
     showNotification('Error Loading Data', errorMessage, 'error');
 
@@ -77,6 +80,65 @@ async function loadData() {
     isLoading = false;
     hideLoadingState();
   }
+}
+
+/**
+ * Setup real-time sync event handlers for automatic UI updates
+ */
+function setupRealtimeSyncHandlers() {
+  // Character created (by external source - e.g., another tab)
+  characterCache.on('character:created:external', (character) => {
+    console.log('External character created, updating UI:', character.id);
+    characters = characterCache.getAllCharacters();
+    renderCharacterList();
+    showNotification('Character Added', `${character.name} was created`, 'info');
+  });
+
+  // Character updated (by external source)
+  characterCache.on('character:updated:external', (character) => {
+    console.log('External character updated, updating UI:', character.id);
+    characters = characterCache.getAllCharacters();
+    renderCharacterList();
+
+    // If currently viewing this character, reload its data
+    if (currentCharacter && currentCharacter.id === character.id) {
+      loadCharacterData(character);
+    }
+  });
+
+  // Character deleted (by external source)
+  characterCache.on('character:deleted:external', ({ id }) => {
+    console.log('External character deleted, updating UI:', id);
+    characters = characterCache.getAllCharacters();
+    renderCharacterList();
+
+    // If currently viewing this character, close the card
+    if (currentCharacter && currentCharacter.id === id) {
+      hideCharacterCard();
+      showNotification('Character Deleted', 'The character you were viewing was deleted', 'warning');
+    }
+  });
+
+  // Voice created (by external source)
+  characterCache.on('voice:created:external', (voice) => {
+    console.log('External voice created, updating UI:', voice.voice);
+    voices = characterCache.getAllVoices();
+    populateVoiceDropdown();
+  });
+
+  // Voice updated (by external source)
+  characterCache.on('voice:updated:external', (voice) => {
+    console.log('External voice updated, updating UI:', voice.voice);
+    voices = characterCache.getAllVoices();
+    populateVoiceDropdown();
+  });
+
+  // Voice deleted (by external source)
+  characterCache.on('voice:deleted:external', ({ voice }) => {
+    console.log('External voice deleted, updating UI:', voice);
+    voices = characterCache.getAllVoices();
+    populateVoiceDropdown();
+  });
 }
 
 /**
@@ -704,19 +766,13 @@ async function handleCreateVoice() {
   }
 
   try {
-    // Create voice via Supabase
-    const { data, error } = await supabase
-      .from(TABLES.VOICES)
-      .insert([voiceData])
-      .select()
-      .single();
-
-    if (error) throw error;
+    // Create voice via cache (optimistic update + background sync)
+    const data = await characterCache.createVoice(voiceData);
 
     console.log('Voice created:', data);
 
-    // Add to local voices array
-    voices.push(data);
+    // Update local voices array from cache
+    voices = characterCache.getAllVoices();
 
     // Update voice dropdown
     populateVoiceDropdown();
@@ -735,7 +791,6 @@ async function handleCreateVoice() {
     );
   } catch (error) {
     console.error('Error creating voice:', error);
-    logError('handleCreateVoice', error);
     const errorMessage = handleSupabaseError(error);
     showNotification('Error Creating Voice', errorMessage, 'error');
   } finally {
@@ -791,40 +846,19 @@ async function saveCharacter() {
     let savedCharacter;
 
     if (isNewCharacter) {
-      // Create new character via Supabase
-      const { data, error } = await supabase
-        .from(TABLES.CHARACTERS)
-        .insert([characterData])
-        .select()
-        .single();
-
-      if (error) throw error;
-      savedCharacter = data;
+      // Create new character via cache (optimistic update + background sync)
+      savedCharacter = await characterCache.createCharacter(characterData);
       console.log('Character created:', savedCharacter);
-
-      // Add to local array
-      characters.push(savedCharacter);
     } else {
-      // Update existing character via Supabase
-      const { data, error } = await supabase
-        .from(TABLES.CHARACTERS)
-        .update(characterData)
-        .eq('id', currentCharacter.id)
-        .select()
-        .single();
-
-      if (error) throw error;
-      savedCharacter = data;
+      // Update existing character via cache (optimistic update + background sync)
+      savedCharacter = await characterCache.updateCharacter(currentCharacter.id, characterData);
       console.log('Character updated:', savedCharacter);
-
-      // Update in local array
-      const index = characters.findIndex(c => c.id === currentCharacter.id);
-      if (index !== -1) {
-        characters[index] = savedCharacter;
-      }
     }
 
-    // Re-render the character list
+    // Update local array from cache
+    characters = characterCache.getAllCharacters();
+
+    // Re-render the character list (UI already updated optimistically, but refresh to be sure)
     renderCharacterList();
 
     // Show success notification
@@ -838,7 +872,6 @@ async function saveCharacter() {
     hideCharacterCard();
   } catch (error) {
     console.error('Error saving character:', error);
-    logError('saveCharacter', error);
     const errorMessage = handleSupabaseError(error);
     showNotification(
       'Error Saving Character',
@@ -878,20 +911,15 @@ async function deleteCharacter() {
   }
 
   try {
-    // Delete via Supabase
-    const { error } = await supabase
-      .from(TABLES.CHARACTERS)
-      .delete()
-      .eq('id', characterId);
-
-    if (error) throw error;
+    // Delete via cache (optimistic update + background sync)
+    await characterCache.deleteCharacter(characterId);
 
     console.log('Character deleted:', characterId);
 
-    // Remove from local array
-    characters = characters.filter(c => c.id !== characterId);
+    // Update local array from cache
+    characters = characterCache.getAllCharacters();
 
-    // Re-render the character list
+    // Re-render the character list (UI already updated optimistically)
     renderCharacterList();
 
     // Show success notification
@@ -905,7 +933,6 @@ async function deleteCharacter() {
     hideCharacterCard();
   } catch (error) {
     console.error('Error deleting character:', error);
-    logError('deleteCharacter', error);
     const errorMessage = handleSupabaseError(error);
     showNotification(
       'Error Deleting Character',
