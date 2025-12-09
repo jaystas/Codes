@@ -6,6 +6,7 @@
 
 import { websocket, MESSAGE_TYPES } from './websocket.js';
 import { getEditor, clearEditorContent } from './editor.js';
+import { audio } from './audio.js';
 
 // ============================================================================
 // Constants
@@ -496,18 +497,35 @@ const handleNewChat = (chatManager) => {
 /**
  * Handle mic button click
  */
-const handleMicClick = (chatManager) => {
+const handleMicClick = async (chatManager) => {
   const { micButton } = getChatElements();
 
   if (chatManager.state.micState === MIC_STATE.IDLE) {
-    // Start listening
+    // Start listening and capture audio
     chatManager.state = setMicState(chatManager.state, MIC_STATE.LISTENING);
     updateMicButtonState(micButton, MIC_STATE.LISTENING);
+
+    // Start audio capture
+    const started = await audio.startCapture();
+    if (!started) {
+      // Revert state if capture failed
+      chatManager.state = setMicState(chatManager.state, MIC_STATE.IDLE);
+      updateMicButtonState(micButton, MIC_STATE.IDLE);
+      console.error('Failed to start audio capture');
+      return;
+    }
+
+    // Notify backend
     websocket.startListening();
   } else {
     // Stop listening/recording
     chatManager.state = setMicState(chatManager.state, MIC_STATE.IDLE);
     updateMicButtonState(micButton, MIC_STATE.IDLE);
+
+    // Stop audio capture
+    audio.stopCapture();
+
+    // Notify backend
     websocket.stopListening();
   }
 };
@@ -596,10 +614,14 @@ export const createChatManager = () => {
     },
 
     // Initialize
-    initialize: () => {
+    initialize: async () => {
       setupWebSocketHandlers(chatManager);
       setupEventListeners(chatManager);
       initializeMicButton();
+
+      // Initialize audio manager
+      await audio.initialize();
+
       console.log('Chat manager initialized');
     },
 
