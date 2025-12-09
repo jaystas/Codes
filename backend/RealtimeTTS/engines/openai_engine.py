@@ -1,7 +1,7 @@
 from .base_engine import BaseEngine
+from ..audio_formats import AudioFormat
 from openai import OpenAI
 from typing import Union
-import pyaudio
 import time
 
 # ANSI escape codes for colors
@@ -75,19 +75,20 @@ class OpenAIEngine(BaseEngine):
 
     def get_stream_info(self):
         """
-        Returns the PyAudio stream configuration information suitable
+        Returns the audio stream configuration information suitable
         for OpenAI Engine.
 
         Returns:
             tuple: A tuple containing the audio format, number of channels,
               and the sample rate.
-              For "pcm" response_format, returns (pyaudio.paInt16, 1, 22050).
-              For "mp3", returns (pyaudio.paCustomFormat, 1, 22050).
+              For "pcm" response_format, returns (AudioFormat.INT16, 1, 22050).
+              For "mp3", returns (AudioFormat.CUSTOM, -1, -1) for MPEG streaming.
         """
         if self.response_format == "pcm":
-            return pyaudio.paInt16, 1, 22050
+            return AudioFormat.INT16, 1, 22050
         else:
-            return pyaudio.paCustomFormat, 1, 22050
+            # MPEG format uses CUSTOM with -1 channels and rate
+            return AudioFormat.CUSTOM, -1, -1
 
     def synthesize(self, text: str) -> bool:
         """

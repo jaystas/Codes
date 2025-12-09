@@ -3,10 +3,10 @@ import time
 import logging
 import requests
 import traceback
-import pyaudio
 from queue import Queue
 from typing import Optional, Union
 from .base_engine import BaseEngine
+from ..audio_formats import AudioFormat
 
 # Default configuration values
 DEFAULT_API_URL = "https://poorly-emerging-joey.ngrok-free.app/v1/completions"
@@ -89,12 +89,12 @@ class OrpheusEngine(BaseEngine):
 
     def get_stream_info(self):
         """
-        Retrieve PyAudio stream configuration.
+        Retrieve audio stream configuration.
 
         Returns:
-            tuple: Format, channel count, and sample rate for PyAudio.
+            tuple: Format, channel count, and sample rate.
         """
-        return pyaudio.paInt16, 1, SAMPLE_RATE
+        return AudioFormat.INT16, 1, SAMPLE_RATE
 
     def synthesize(self, text: str) -> bool:
         """

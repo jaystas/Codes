@@ -9,27 +9,39 @@ Converts text into real-time audio using one or more TTS engines. Key features i
 - Callbacks: Offers hooks for stream events, per-character, and per-word processing.
 - Buffer Management: Generates audio chunks based on buffered duration.
 - Output Options: Plays audio live or writes to a WAV file.
+
+Supports two player backends:
+- 'pyaudio': Local speaker output (requires PyAudio)
+- 'headless': Callback-only mode for remote/browser streaming (no PyAudio needed)
 """
 
 
 from .threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
-from .stream_player import StreamPlayer, AudioConfiguration
-from typing import Union, Iterator, List
+from .audio_formats import AudioFormat
+from typing import Union, Iterator, List, Optional
 from .engines import BaseEngine
-try:
-    import pyaudio._portaudio as pa
-except ImportError:
-    print("Could not import the PyAudio C module 'pyaudio._portaudio'.")
-    raise
 import stream2sentence as s2s
 import numpy as np
 import threading
 import traceback
 import logging
-import pyaudio
 import queue
 import time
 import wave
+
+# Try to import PyAudio-dependent modules
+PYAUDIO_AVAILABLE = False
+try:
+    from .stream_player import StreamPlayer, AudioConfiguration, PYAUDIO_AVAILABLE as _PA
+    PYAUDIO_AVAILABLE = _PA
+except ImportError:
+    StreamPlayer = None
+    AudioConfiguration = None
+    logging.info("PyAudio-based StreamPlayer not available. Using headless mode.")
+
+# Always available headless player
+from .headless_player import HeadlessPlayer
+from .audio_player_base import AudioConfig
 
 class TextToAudioStream:
     def __init__(
@@ -46,9 +58,10 @@ class TextToAudioStream:
         tokenizer: str = "nltk",
         language: str = "en",
         muted: bool = False,
-        frames_per_buffer: int = pa.paFramesPerBufferUnspecified,
+        frames_per_buffer: int = AudioFormat.FRAMES_PER_BUFFER_UNSPECIFIED,
         playout_chunk_size: int = -1,
         level=logging.WARNING,
+        player_backend: str = "auto",
     ):
         """
         Initializes the TextToAudioStream.
@@ -141,8 +154,16 @@ class TextToAudioStream:
                 The logging level to use for internal logging. Accepts standard
                 Python logging levels, such as `logging.DEBUG`, `logging.INFO`,
                 `logging.WARNING`, etc. Defaults to `logging.WARNING`.
+
+            player_backend (str, optional):
+                The audio player backend to use:
+                - "auto": Automatically select (PyAudio if available, else headless)
+                - "pyaudio": Use PyAudio for local speaker output (requires PyAudio)
+                - "headless": Use callback-only mode without audio device (for streaming)
+                Defaults to "auto".
         """
         self.log_characters = log_characters
+        self.player_backend = player_backend
         self.on_text_stream_start = on_text_stream_start
         self.on_text_stream_stop = on_text_stream_stop
         self.on_audio_stream_start = on_audio_stream_start
@@ -192,7 +213,7 @@ class TextToAudioStream:
     def load_engine(self, engine: BaseEngine):
         """
         Loads the synthesis engine and prepares the audio player for stream playback.
-        This method sets up the engine that will be used for text-to-audio conversion, extracts the necessary stream information like format, channels, and rate from the engine, and initializes the StreamPlayer if the engine does not support consuming generators directly.
+        This method sets up the engine that will be used for text-to-audio conversion, extracts the necessary stream information like format, channels, and rate from the engine, and initializes the appropriate player backend.
 
         Args:
             engine (BaseEngine): The synthesis engine to be used for converting text to audio.
@@ -204,26 +225,59 @@ class TextToAudioStream:
         # Extract stream information (format, channels, rate) from the engine
         format, channels, rate = self.engine.get_stream_info()
 
-        # Check if the engine doesn't support consuming generators directly
-        config = AudioConfiguration(
-            format,
-            channels,
-            rate,
-            self.output_device_index,
-            muted=self.global_muted,
-            frames_per_buffer=self.frames_per_buffer,
-            playout_chunk_size=self.playout_chunk_size,
-        )
+        # Determine which player backend to use
+        use_headless = False
+        if self.player_backend == "headless":
+            use_headless = True
+        elif self.player_backend == "pyaudio":
+            if not PYAUDIO_AVAILABLE:
+                raise ImportError(
+                    "PyAudio player backend requested but PyAudio is not available. "
+                    "Install PyAudio or use player_backend='headless'."
+                )
+            use_headless = False
+        else:  # "auto"
+            use_headless = not PYAUDIO_AVAILABLE or self.global_muted
 
-        self.player = StreamPlayer(
-            self.engine.queue,
-            self.engine.timings,
-            config,
-            on_playback_start=self._on_audio_stream_start,
-            on_word_spoken=self._on_word_spoken,
-        )
+        if use_headless:
+            # Use headless player (no PyAudio needed)
+            config = AudioConfig(
+                format=format,
+                channels=channels,
+                rate=rate,
+                muted=self.global_muted,
+                frames_per_buffer=self.frames_per_buffer,
+                playout_chunk_size=self.playout_chunk_size,
+            )
 
-        logging.info(f"loaded engine {self.engine.engine_name}")
+            self.player = HeadlessPlayer(
+                self.engine.queue,
+                self.engine.timings,
+                config,
+                on_playback_start=self._on_audio_stream_start,
+                on_word_spoken=self._on_word_spoken,
+            )
+            logging.info(f"loaded engine {self.engine.engine_name} with headless player")
+        else:
+            # Use PyAudio-based StreamPlayer
+            config = AudioConfiguration(
+                format,
+                channels,
+                rate,
+                self.output_device_index,
+                muted=self.global_muted,
+                frames_per_buffer=self.frames_per_buffer,
+                playout_chunk_size=self.playout_chunk_size,
+            )
+
+            self.player = StreamPlayer(
+                self.engine.queue,
+                self.engine.timings,
+                config,
+                on_playback_start=self._on_audio_stream_start,
+                on_word_spoken=self._on_word_spoken,
+            )
+            logging.info(f"loaded engine {self.engine.engine_name} with PyAudio player")
 
     def feed(self, text_or_iterator: Union[str, Iterator[str]]):
         """
@@ -533,7 +587,7 @@ class TextToAudioStream:
 
                                 if silence_duration > 0:
                                     silent_samples = int(sample_rate * silence_duration)
-                                    if stream_format==pyaudio.paInt16:
+                                    if stream_format == AudioFormat.INT16:
                                         silent_chunk = np.zeros(silent_samples, dtype=np.int16)
                                     else:
                                         silent_chunk = np.zeros(silent_samples, dtype=np.float32)
@@ -747,14 +801,14 @@ class TextToAudioStream:
         """
         Postprocessing of single chunks of audio data.
         This method is called for each chunk of audio data processed. It first determines the audio stream format.
-        If the format is `pyaudio.paFloat32`, we convert to paInt16.
+        If the format is `AudioFormat.FLOAT32`, we convert to INT16.
 
         Args:
             chunk (bytes): The audio data chunk to be processed.
         """
         format, channels, sample_rate = self.engine.get_stream_info()
 
-        if format == pyaudio.paFloat32:
+        if format == AudioFormat.FLOAT32:
             audio_data = np.frombuffer(chunk, dtype=np.float32)
             audio_data = np.int16(audio_data * 32767)
             chunk = audio_data.tobytes()
@@ -829,7 +883,7 @@ class TextToAudioStream:
             Boolean indicating if the engine is an MPEG engine.
         """
         format, channel, rate = self.engine.get_stream_info()
-        return format == pyaudio.paCustomFormat and channel == -1 and rate == -1
+        return format == AudioFormat.CUSTOM and channel == -1 and rate == -1
 
     def _synthesis_chunk_generator(
         self,

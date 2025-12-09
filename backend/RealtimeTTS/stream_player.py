@@ -14,23 +14,34 @@ Key Components:
   4. StreamPlayer: Orchestrates playback, handles events, and supports callbacks.
 
 Designed for flexible, real-time audio playback and streaming, with error handling for unsupported configurations.
+
+Note: PyAudio is now optional. When not available, use HeadlessPlayer instead.
 """
 from pydub import AudioSegment
-try:
-    import pyaudio._portaudio as pa
-except ImportError:
-    print("Could not import the PyAudio C module 'pyaudio._portaudio'.")
-    raise
 import numpy as np
 import subprocess
 import threading
 import resampy
-import pyaudio
 import logging
 import shutil
 import queue
 import time
 import io
+
+# Import our PyAudio-free format constants
+from .audio_formats import AudioFormat
+
+# Try to import PyAudio - it's optional now
+PYAUDIO_AVAILABLE = False
+try:
+    import pyaudio._portaudio as pa
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    # PyAudio not available - use our format constants
+    pa = None
+    pyaudio = None
+    logging.info("PyAudio not available. Use HeadlessPlayer for audio processing.")
 
 
 class AudioConfiguration:
@@ -40,17 +51,17 @@ class AudioConfiguration:
 
     def __init__(
         self,
-        format: int = pyaudio.paInt16,
+        format: int = AudioFormat.INT16,
         channels: int = 1,
         rate: int = 16000,
         output_device_index=None,
         muted: bool = False,
-        frames_per_buffer: int = pa.paFramesPerBufferUnspecified,
+        frames_per_buffer: int = AudioFormat.FRAMES_PER_BUFFER_UNSPECIFIED,
         playout_chunk_size: int = -1,
     ):
         """
         Args:
-            format (int): Audio format, typically one of PyAudio's predefined constants, e.g., pyaudio.paInt16 (default).
+            format (int): Audio format constant from AudioFormat (e.g., AudioFormat.INT16). Default is INT16 (16-bit).
             channels (int): Number of audio channels, e.g., 1 for mono or 2 for stereo. Defaults to 1 (mono).
             rate (int): Sample rate of the audio stream in Hz. Defaults to 16000.
             output_device_index (int): Index of the audio output device. If None, the default output device is used.
@@ -72,13 +83,25 @@ class AudioStream:
     """
     Handles audio stream operations
     - opening, starting, stopping, and closing
+
+    Note: Requires PyAudio to be installed. If PyAudio is not available,
+    use HeadlessPlayer instead for audio processing without device output.
     """
 
     def __init__(self, config: AudioConfiguration):
         """
         Args:
             config (AudioConfiguration): Object containing audio settings.
+
+        Raises:
+            ImportError: If PyAudio is not available
         """
+        if not PYAUDIO_AVAILABLE:
+            raise ImportError(
+                "PyAudio is not available. Install it with 'pip install pyaudio' "
+                "or use HeadlessPlayer for audio processing without device output."
+            )
+
         self.config = config
         self.stream = None
         self.pyaudio_instance = pyaudio.PyAudio()
@@ -186,7 +209,7 @@ class AudioStream:
             logging.debug("Muted mode, no opening stream")
 
         else:
-            if self.config.format == pyaudio.paCustomFormat and pyChannels == -1 and desired_rate == -1:
+            if self.config.format == AudioFormat.CUSTOM and pyChannels == -1 and desired_rate == -1:
                 logging.debug("Opening mpv stream for mpeg audio chunks, no need to determine sample rate")
                 if not self.is_installed("mpv"):
                     message = (
@@ -221,7 +244,7 @@ class AudioStream:
             best_rate = self._get_best_sample_rate(pyOutput_device_index, desired_rate)
             self.actual_sample_rate = best_rate
 
-            if self.config.format == pyaudio.paCustomFormat:
+            if self.config.format == AudioFormat.CUSTOM:
                 pyFormat = self.pyaudio_instance.get_format_from_width(2)
                 logging.debug(
                     "Opening stream for mpeg audio chunks, "
@@ -358,15 +381,15 @@ class AudioBufferManager:
         try:
             chunk = self.audio_buffer.get(timeout=timeout)
 
-            # Map PyAudio format to bytes per sample
+            # Map audio format to bytes per sample
             format_bytes = {
-                pyaudio.paCustomFormat: 4,
-                pyaudio.paFloat32: 4,
-                pyaudio.paInt32: 4,
-                pyaudio.paInt24: 3,
-                pyaudio.paInt16: 2,
-                pyaudio.paInt8: 1,
-                pyaudio.paUInt8: 1
+                AudioFormat.CUSTOM: 4,
+                AudioFormat.FLOAT32: 4,
+                AudioFormat.INT32: 4,
+                AudioFormat.INT24: 3,
+                AudioFormat.INT16: 2,
+                AudioFormat.INT8: 1,
+                AudioFormat.UINT8: 1
             }
 
             # Get format and channels from config
@@ -478,7 +501,7 @@ class StreamPlayer:
             print(f"Error sending audio data to mpv: {e}")
 
     def _play_wav_chunk(self, chunk):
-        if self.audio_stream.config.format == pyaudio.paCustomFormat:
+        if self.audio_stream.config.format == AudioFormat.CUSTOM:
             segment = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
             chunk = segment.raw_data
             sample_width = segment.sample_width
@@ -488,7 +511,7 @@ class StreamPlayer:
             channels = self.audio_stream.config.channels
 
         if self.audio_stream.config.rate != self.audio_stream.actual_sample_rate and self.audio_stream.actual_sample_rate > 0:
-            if self.audio_stream.config.format == pyaudio.paFloat32:
+            if self.audio_stream.config.format == AudioFormat.FLOAT32:
                 audio_data = np.frombuffer(chunk, dtype=np.float32)
                 resampled_data = resampy.resample(audio_data, self.audio_stream.config.rate, self.audio_stream.actual_sample_rate)
                 chunk = resampled_data.astype(np.float32).tobytes()
@@ -501,7 +524,7 @@ class StreamPlayer:
         if self.audio_stream.config.playout_chunk_size > 0:
             sub_chunk_size = self.audio_stream.config.playout_chunk_size
         else:
-            if self.audio_stream.config.frames_per_buffer == pa.paFramesPerBufferUnspecified:
+            if self.audio_stream.config.frames_per_buffer == AudioFormat.FRAMES_PER_BUFFER_UNSPECIFIED:
                 sub_chunk_size = 512
             else:
                 sub_chunk_size = self.audio_stream.config.frames_per_buffer * sample_width * channels
@@ -571,7 +594,7 @@ class StreamPlayer:
         """
         # --- Handle Raw MPEG Stream (MPV) ---
         is_mpeg_stream = (
-            self.audio_stream.config.format == pyaudio.paCustomFormat and
+            self.audio_stream.config.format == AudioFormat.CUSTOM and
             self.audio_stream.config.channels == -1 and
             self.audio_stream.config.rate == -1
         )
