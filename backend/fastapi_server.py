@@ -538,6 +538,42 @@ class LLMService:
         """Set the active characters for the conversation"""
         self.active_characters = characters
 
+    async def load_active_characters_from_db(self):
+        """Load active characters from Supabase database"""
+        try:
+            logger.info("Loading active characters from database...")
+
+            response = supabase.table("characters") \
+                .select("*") \
+                .eq("is_active", True) \
+                .execute()
+
+            if response.data:
+                characters = [
+                    Character(
+                        id=char.get("id", str(uuid.uuid4())),
+                        name=char.get("name", ""),
+                        voice=char.get("voice", ""),
+                        system_prompt=char.get("system_prompt", ""),
+                        image_url=char.get("image_url", ""),
+                        images=char.get("images", []),
+                        is_active=char.get("is_active", True)
+                    )
+                    for char in response.data
+                ]
+
+                self.set_active_characters(characters)
+                logger.info(f"✅ Loaded {len(characters)} active characters: {[c.name for c in characters]}")
+                return characters
+            else:
+                logger.info("No active characters found in database")
+                self.set_active_characters([])
+                return []
+
+        except Exception as e:
+            logger.error(f"Failed to load active characters from database: {e}")
+            return []
+
     def set_model_settings(self, model_settings: ModelSettings):
         """Set model settings for LLM requests"""
         self.model_settings = model_settings
@@ -1111,6 +1147,10 @@ class WebSocketManager:
         self.websocket = websocket
         logger.info("WebSocket connected")
 
+        # Load active characters from database on connection
+        if self.llm_service:
+            await self.llm_service.load_active_characters_from_db()
+
         await self.start_service_tasks()
 
     async def start_service_tasks(self):
@@ -1222,6 +1262,12 @@ class WebSocketManager:
                 if self.llm_service:
                     self.llm_service.interrupt_event.set()
                 logger.info("Interrupt signal sent")
+
+            elif message_type == "refresh_active_characters":
+                # Refresh active characters from database
+                if self.llm_service:
+                    await self.llm_service.load_active_characters_from_db()
+                logger.info("Active characters refreshed from database")
 
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)

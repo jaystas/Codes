@@ -8,6 +8,7 @@
 import { characterCache } from './characterCache.js';
 import { realtimeSync } from './realtimeSync.js';
 import { handleSupabaseError } from './supabase.js';
+import { websocket } from './websocket.js';
 
 // Character data storage (populated from cache)
 let characters = [];
@@ -277,11 +278,7 @@ function setupEventListeners() {
   // Chat button
   const chatBtn = document.getElementById('chat-character-btn');
   if (chatBtn) {
-    chatBtn.addEventListener('click', () => {
-      console.log('Opening chat with character...');
-      // TODO: Navigate to chat page with this character
-      alert('Chat functionality will be implemented in the next phase');
-    });
+    chatBtn.addEventListener('click', () => handleChatWithCharacter());
   }
 
   // Voice tab - Method radio buttons
@@ -944,6 +941,74 @@ async function deleteCharacter() {
     if (deleteBtn) {
       deleteBtn.disabled = false;
       deleteBtn.textContent = 'Delete';
+    }
+  }
+}
+
+/**
+ * Handle chat button click - activate character and navigate to chat
+ */
+async function handleChatWithCharacter() {
+  if (!currentCharacter || !currentCharacter.id) {
+    showNotification('Error', 'Please save the character first before chatting', 'error');
+    return;
+  }
+
+  const chatBtn = document.getElementById('chat-character-btn');
+  if (chatBtn) {
+    chatBtn.disabled = true;
+    chatBtn.textContent = 'Activating...';
+  }
+
+  try {
+    // Update character to set is_active = true
+    await characterCache.updateCharacter(currentCharacter.id, {
+      is_active: true
+    });
+
+    console.log(`✅ Character ${currentCharacter.name} activated for chat`);
+
+    // Send WebSocket message to refresh active characters on server
+    // Note: WebSocket might not be connected if we're on the characters page
+    if (websocket.isConnected()) {
+      websocket.refreshActiveCharacters();
+      console.log('✅ Sent refresh signal to server');
+    } else {
+      console.log('⚠️ WebSocket not connected, server will load on next connection');
+    }
+
+    // Update local state
+    currentCharacter.is_active = true;
+    const characterIndex = characters.findIndex(c => c.id === currentCharacter.id);
+    if (characterIndex !== -1) {
+      characters[characterIndex].is_active = true;
+    }
+
+    // Show success notification
+    showNotification(
+      'Character Activated',
+      `${currentCharacter.name} is now active for chat`,
+      'success'
+    );
+
+    // Navigate to chat page after a short delay
+    setTimeout(() => {
+      // Find the home nav link and trigger click
+      const homeLink = document.querySelector('.nav-link[href="#home"]');
+      if (homeLink) {
+        homeLink.click();
+      }
+    }, 1000);
+
+  } catch (error) {
+    console.error('Error activating character:', error);
+    const errorMessage = handleSupabaseError(error);
+    showNotification('Error Activating Character', errorMessage, 'error');
+  } finally {
+    // Re-enable button
+    if (chatBtn) {
+      chatBtn.disabled = false;
+      chatBtn.textContent = 'Chat';
     }
   }
 }

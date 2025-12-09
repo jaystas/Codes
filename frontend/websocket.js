@@ -27,6 +27,7 @@ export const MESSAGE_TYPES = {
   MODEL_SETTINGS: 'model_settings',
   START_LISTENING: 'start_listening',
   STOP_LISTENING: 'stop_listening',
+  REFRESH_ACTIVE_CHARACTERS: 'refresh_active_characters',
 
   // Incoming (server → client)
   STT_UPDATE: 'stt_update',
@@ -418,6 +419,7 @@ export const createWebSocketConnection = (config = {}) => {
     sendModelSettings: (settings) => sendMessage(connectionManager.state, MESSAGE_TYPES.MODEL_SETTINGS, settings),
     startListening: () => sendMessage(connectionManager.state, MESSAGE_TYPES.START_LISTENING),
     stopListening: () => sendMessage(connectionManager.state, MESSAGE_TYPES.STOP_LISTENING),
+    refreshActiveCharacters: () => sendMessage(connectionManager.state, MESSAGE_TYPES.REFRESH_ACTIVE_CHARACTERS),
 
     // Internal state access (for debugging)
     _getState: () => connectionManager.state,
