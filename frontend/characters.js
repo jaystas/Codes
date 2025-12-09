@@ -1,12 +1,11 @@
 /**
  * characters.js - Character Management Functionality
  * Handles character creation, editing, deletion, and display
+ * Now using Supabase JS client directly for low-latency access
  */
 
-// Import API modules
-import * as CharactersAPI from './api/characters.js';
-import * as VoicesAPI from './api/voices.js';
-import { handleAPIError } from './api/config.js';
+// Import Supabase client
+import { supabase, TABLES, handleSupabaseError, logError } from './supabase.js';
 
 // Character data storage
 let characters = [];
@@ -25,30 +24,39 @@ export async function initCharacters() {
   // Setup event listeners
   setupEventListeners();
 
-  // Load data from backend
+  // Load data from Supabase
   await loadData();
 
   console.log('Characters page initialized');
 }
 
 /**
- * Load all data from backend (characters and voices)
+ * Load all data from Supabase (characters and voices)
  */
 async function loadData() {
   isLoading = true;
   showLoadingState();
 
   try {
-    // Load characters and voices in parallel
-    const [charactersData, voicesData] = await Promise.all([
-      CharactersAPI.getAllCharacters(),
-      VoicesAPI.getAllVoices(),
+    // Load characters and voices in parallel using Supabase
+    const [charactersResult, voicesResult] = await Promise.all([
+      supabase.from(TABLES.CHARACTERS).select('*').order('created_at', { ascending: false }),
+      supabase.from(TABLES.VOICES).select('*').order('created_at', { ascending: false }),
     ]);
 
-    characters = charactersData.map(CharactersAPI.mapCharacterToFrontend);
-    voices = voicesData.map(VoicesAPI.mapVoiceToFrontend);
+    // Handle characters result
+    if (charactersResult.error) {
+      throw charactersResult.error;
+    }
+    characters = charactersResult.data || [];
 
-    console.log(`Loaded ${characters.length} characters and ${voices.length} voices from backend`);
+    // Handle voices result
+    if (voicesResult.error) {
+      throw voicesResult.error;
+    }
+    voices = voicesResult.data || [];
+
+    console.log(`Loaded ${characters.length} characters and ${voices.length} voices from Supabase`);
 
     // Render the character list
     renderCharacterList();
@@ -57,10 +65,13 @@ async function loadData() {
     populateVoiceDropdown();
   } catch (error) {
     console.error('Error loading data:', error);
-    const errorMessage = handleAPIError(error);
+    logError('loadData', error);
+    const errorMessage = handleSupabaseError(error);
     showNotification('Error Loading Data', errorMessage, 'error');
 
     // Render empty state
+    characters = [];
+    voices = [];
     renderCharacterList();
   } finally {
     isLoading = false;
@@ -115,7 +126,7 @@ function populateVoiceDropdown() {
   // Clear existing options except the first placeholder
   voiceSelect.innerHTML = '<option value="">Select voice</option>';
 
-  // Add voices from backend
+  // Add voices from Supabase
   voices.forEach(voice => {
     const option = document.createElement('option');
     option.value = voice.voice;
@@ -269,14 +280,14 @@ function createCharacterItem(character) {
     item.classList.add('active');
   }
 
-  const avatar = character.avatar
-    ? `<img src="${character.avatar}" alt="${character.name}" />`
+  const avatar = character.image_url
+    ? `<img src="${character.image_url}" alt="${character.name}" />`
     : `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
        </svg>`;
 
-  const description = character.systemPrompt
-    ? character.systemPrompt.substring(0, 40) + '...'
+  const description = character.system_prompt
+    ? character.system_prompt.substring(0, 40) + '...'
     : 'No description';
 
   item.innerHTML = `
@@ -373,16 +384,17 @@ function showCharacterCard(isNew = false) {
     currentCharacter = {
       id: null,
       name: 'Character name',
-      avatar: null,
+      image_url: null,
       voice: '',
-      globalPrompt: 'You are {character.name}, a roleplay actor engaging in a conversation with {user.name}. Your replies should be written in a conversational format, taking on the personality and characteristics of {character.name}.',
-      systemPrompt: '',
+      system_prompt: '',
+      images: [],
+      is_active: false,
       voiceData: {
         method: 'clone',
-        speakerDescription: '',
-        scenePrompt: '',
-        audioPath: '',
-        textPath: ''
+        speaker_desc: '',
+        scene_prompt: '',
+        audio_path: '',
+        text_path: ''
       }
     };
     loadCharacterData(currentCharacter);
@@ -445,12 +457,12 @@ function loadCharacterData(character) {
   const headerAvatar = document.getElementById('header-avatar');
   const imageUploadArea = document.getElementById('image-upload-area');
 
-  if (character.avatar) {
+  if (character.image_url) {
     if (headerAvatar) {
-      headerAvatar.innerHTML = `<img src="${character.avatar}" alt="${character.name}" />`;
+      headerAvatar.innerHTML = `<img src="${character.image_url}" alt="${character.name}" />`;
     }
     if (imageUploadArea) {
-      imageUploadArea.innerHTML = `<img src="${character.avatar}" class="image-preview" alt="${character.name}" />`;
+      imageUploadArea.innerHTML = `<img src="${character.image_url}" class="image-preview" alt="${character.name}" />`;
     }
   } else {
     if (headerAvatar) {
@@ -470,16 +482,16 @@ function loadCharacterData(character) {
     }
   }
 
-  // Global prompt
+  // Global prompt (not in database schema - skip for now)
   const globalPromptInput = document.getElementById('character-global-prompt');
   if (globalPromptInput) {
-    globalPromptInput.value = character.globalPrompt || '';
+    globalPromptInput.value = '';
   }
 
   // System prompt
   const systemPromptInput = document.getElementById('character-system-prompt');
   if (systemPromptInput) {
-    systemPromptInput.value = character.systemPrompt || '';
+    systemPromptInput.value = character.system_prompt || '';
   }
 
   // Voice
@@ -507,16 +519,16 @@ function loadCharacterData(character) {
     }
 
     if (speakerDesc) {
-      speakerDesc.value = character.voiceData.speakerDescription || '';
+      speakerDesc.value = character.voiceData.speaker_desc || '';
     }
     if (scenePrompt) {
-      scenePrompt.value = character.voiceData.scenePrompt || '';
+      scenePrompt.value = character.voiceData.scene_prompt || '';
     }
     if (audioPath) {
-      audioPath.value = character.voiceData.audioPath || '';
+      audioPath.value = character.voiceData.audio_path || '';
     }
     if (textPath) {
-      textPath.value = character.voiceData.textPath || '';
+      textPath.value = character.voiceData.text_path || '';
     }
 
     // Update disabled states based on method
@@ -548,7 +560,7 @@ function handleImageUpload(e) {
 
       // Store in current character
       if (currentCharacter) {
-        currentCharacter.avatar = imgUrl;
+        currentCharacter.image_url = imgUrl;
       }
     };
     reader.readAsDataURL(file);
@@ -622,6 +634,24 @@ function handleVoiceMethodChange() {
 }
 
 /**
+ * Generate a voice name from character name
+ */
+function generateVoiceName(characterName) {
+  // Convert to lowercase, replace spaces with dashes, remove special chars
+  const baseName = characterName
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+
+  // Add timestamp to ensure uniqueness
+  const timestamp = Date.now();
+  return `${baseName}-voice-${timestamp}`;
+}
+
+/**
  * Handle Create Voice button click
  */
 async function handleCreateVoice() {
@@ -655,15 +685,15 @@ async function handleCreateVoice() {
   }
 
   // Generate voice name from character name
-  const voiceName = VoicesAPI.generateVoiceName(currentCharacter.name);
+  const voiceName = generateVoiceName(currentCharacter.name);
 
   const voiceData = {
     voice: voiceName,
     method: method,
-    speakerDescription: speakerDesc.value,
-    scenePrompt: scenePrompt.value,
-    audioPath: audioPath.value,
-    textPath: textPath.value
+    speaker_desc: speakerDesc.value,
+    scene_prompt: scenePrompt.value,
+    audio_path: audioPath.value,
+    text_path: textPath.value
   };
 
   // Disable button
@@ -674,12 +704,19 @@ async function handleCreateVoice() {
   }
 
   try {
-    // Create voice via API
-    const createdVoice = await VoicesAPI.createVoice(voiceData);
-    console.log('Voice created:', createdVoice);
+    // Create voice via Supabase
+    const { data, error } = await supabase
+      .from(TABLES.VOICES)
+      .insert([voiceData])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    console.log('Voice created:', data);
 
     // Add to local voices array
-    voices.push(VoicesAPI.mapVoiceToFrontend(createdVoice));
+    voices.push(data);
 
     // Update voice dropdown
     populateVoiceDropdown();
@@ -687,18 +724,19 @@ async function handleCreateVoice() {
     // Auto-select the newly created voice
     const voiceSelect = document.getElementById('character-voice');
     if (voiceSelect) {
-      voiceSelect.value = createdVoice.voice;
-      currentCharacter.voice = createdVoice.voice;
+      voiceSelect.value = data.voice;
+      currentCharacter.voice = data.voice;
     }
 
     showNotification(
       'Voice Created',
-      `Voice "${createdVoice.voice}" created successfully and assigned to ${currentCharacter.name}`,
+      `Voice "${data.voice}" created successfully and assigned to ${currentCharacter.name}`,
       'success'
     );
   } catch (error) {
     console.error('Error creating voice:', error);
-    const errorMessage = handleAPIError(error);
+    logError('handleCreateVoice', error);
+    const errorMessage = handleSupabaseError(error);
     showNotification('Error Creating Voice', errorMessage, 'error');
   } finally {
     // Re-enable button
@@ -720,16 +758,8 @@ async function saveCharacter() {
 
   // Get form values
   const nameInput = document.getElementById('character-name-input');
-  const globalPromptInput = document.getElementById('character-global-prompt');
   const systemPromptInput = document.getElementById('character-system-prompt');
   const voiceSelect = document.getElementById('character-voice');
-
-  // Get voice tab values
-  const cloneRadio = document.getElementById('voice-method-clone');
-  const speakerDesc = document.getElementById('voice-speaker-description');
-  const scenePrompt = document.getElementById('voice-scene-prompt');
-  const audioPath = document.getElementById('voice-audio-path');
-  const textPath = document.getElementById('voice-text-path');
 
   // Validate required fields
   const characterName = nameInput?.value?.trim();
@@ -738,19 +768,14 @@ async function saveCharacter() {
     return;
   }
 
-  // Update character object
-  currentCharacter.name = characterName;
-  currentCharacter.globalPrompt = globalPromptInput?.value || '';
-  currentCharacter.systemPrompt = systemPromptInput?.value || '';
-  currentCharacter.voice = voiceSelect?.value || '';
-
-  // Update voice data
-  currentCharacter.voiceData = {
-    method: cloneRadio?.checked ? 'clone' : 'profile',
-    speakerDescription: speakerDesc?.value || '',
-    scenePrompt: scenePrompt?.value || '',
-    audioPath: audioPath?.value || '',
-    textPath: textPath?.value || ''
+  // Prepare character data for Supabase
+  const characterData = {
+    name: characterName,
+    system_prompt: systemPromptInput?.value || '',
+    voice: voiceSelect?.value || '',
+    image_url: currentCharacter.image_url || '',
+    images: currentCharacter.images || [],
+    is_active: currentCharacter.is_active || false,
   };
 
   const isNewCharacter = !currentCharacter.id;
@@ -766,22 +791,36 @@ async function saveCharacter() {
     let savedCharacter;
 
     if (isNewCharacter) {
-      // Create new character via API
-      savedCharacter = await CharactersAPI.createCharacter(currentCharacter);
+      // Create new character via Supabase
+      const { data, error } = await supabase
+        .from(TABLES.CHARACTERS)
+        .insert([characterData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      savedCharacter = data;
       console.log('Character created:', savedCharacter);
 
       // Add to local array
-      const mappedCharacter = CharactersAPI.mapCharacterToFrontend(savedCharacter);
-      characters.push(mappedCharacter);
+      characters.push(savedCharacter);
     } else {
-      // Update existing character via API
-      savedCharacter = await CharactersAPI.updateCharacter(currentCharacter.id, currentCharacter);
+      // Update existing character via Supabase
+      const { data, error } = await supabase
+        .from(TABLES.CHARACTERS)
+        .update(characterData)
+        .eq('id', currentCharacter.id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      savedCharacter = data;
       console.log('Character updated:', savedCharacter);
 
       // Update in local array
       const index = characters.findIndex(c => c.id === currentCharacter.id);
       if (index !== -1) {
-        characters[index] = CharactersAPI.mapCharacterToFrontend(savedCharacter);
+        characters[index] = savedCharacter;
       }
     }
 
@@ -799,7 +838,8 @@ async function saveCharacter() {
     hideCharacterCard();
   } catch (error) {
     console.error('Error saving character:', error);
-    const errorMessage = handleAPIError(error);
+    logError('saveCharacter', error);
+    const errorMessage = handleSupabaseError(error);
     showNotification(
       'Error Saving Character',
       errorMessage,
@@ -838,8 +878,14 @@ async function deleteCharacter() {
   }
 
   try {
-    // Delete via API
-    await CharactersAPI.deleteCharacter(characterId);
+    // Delete via Supabase
+    const { error } = await supabase
+      .from(TABLES.CHARACTERS)
+      .delete()
+      .eq('id', characterId);
+
+    if (error) throw error;
+
     console.log('Character deleted:', characterId);
 
     // Remove from local array
@@ -859,7 +905,8 @@ async function deleteCharacter() {
     hideCharacterCard();
   } catch (error) {
     console.error('Error deleting character:', error);
-    const errorMessage = handleAPIError(error);
+    logError('deleteCharacter', error);
+    const errorMessage = handleSupabaseError(error);
     showNotification(
       'Error Deleting Character',
       errorMessage,
@@ -872,13 +919,6 @@ async function deleteCharacter() {
       deleteBtn.textContent = 'Delete';
     }
   }
-}
-
-/**
- * Generate a unique ID
- */
-function generateId() {
-  return 'char_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
 }
 
 /**
