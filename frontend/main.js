@@ -586,13 +586,13 @@ function loadPage(page, container) {
     // Initialize editor if on home page
     if (page === 'home') {
       // Wait a bit for DOM to be ready
-      setTimeout(() => {
+      setTimeout(async () => {
         initEditor();
         initDrawer();
         initInfoDrawer();
 
         // Initialize chat and connect websocket
-        chat.initialize();
+        await chat.initialize();
         websocket.connect();
       }, 100);
     }
