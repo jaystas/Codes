@@ -2,9 +2,13 @@
 
 from .text_to_stream import TextToAudioStream
 from .engines import BaseEngine, TimingInfo
+from .audio_formats import AudioFormat
+from .audio_player_base import AudioPlayerBase, AudioConfig, create_player
+from .headless_player import HeadlessPlayer
 
 __all__ = [
     "TextToAudioStream", "BaseEngine", "TimingInfo",
+    "AudioFormat", "AudioPlayerBase", "AudioConfig", "HeadlessPlayer",
     "SystemEngine", "SystemVoice",
     "AzureEngine", "AzureVoice",
     "ElevenlabsEngine", "ElevenlabsVoice",

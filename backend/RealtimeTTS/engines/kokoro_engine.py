@@ -6,11 +6,11 @@ Requires:
 """
 
 from .base_engine import BaseEngine, TimingInfo
+from ..audio_formats import AudioFormat
 from queue import Queue
 from typing import List, Union
 import numpy as np
 import traceback
-import pyaudio
 import time
 
 # Make sure torch is installed
@@ -198,13 +198,13 @@ class KokoroEngine(BaseEngine):
 
     def get_stream_info(self):
         """
-        Provides the PyAudio stream configuration for the synthesized audio.
+        Provides the audio stream configuration for the synthesized audio.
 
         Returns:
-            tuple: (pyaudio.paInt16, 1, 24000)
+            tuple: (AudioFormat.INT16, 1, 24000)
         """
         # Kokoro uses 24 kHz sampling rate, mono channel, with 16-bit samples.
-        return (pyaudio.paInt16, 1, 24000)
+        return (AudioFormat.INT16, 1, 24000)
 
     def synthesize(self, text: str) -> bool:
         """

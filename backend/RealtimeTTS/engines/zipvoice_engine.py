@@ -9,6 +9,7 @@ from typing import Optional, Union
 
 # RealtimeTTS imports
 from .base_engine import BaseEngine
+from ..audio_formats import AudioFormat
 
 prompt_wav_path = "D:/Chat/app/voices/amelia.wav"
 prompt_text = "Hi I'm Amelia, a super high quality English voice. I love to read, seriously, I'm a total bookworm. So what are you waiting for? Get me reading!"
@@ -245,9 +246,8 @@ class ZipVoiceEngine(BaseEngine):
         self.engine_name = "zipvoice"
 
     def get_stream_info(self):
-        import pyaudio
         # The vocoder outputs float32, but we convert to int16 for broader compatibility.
-        return pyaudio.paInt16, 1, self.sampling_rate
+        return AudioFormat.INT16, 1, self.sampling_rate
 
     @torch.inference_mode()
     def synthesize(self, text: str) -> bool:

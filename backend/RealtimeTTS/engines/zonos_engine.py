@@ -7,10 +7,10 @@ text-to-speech synthesis using streaming audio generation.
 
 import torch
 import torchaudio
-import pyaudio
 import numpy as np
 from typing import Union, List
 from RealtimeTTS.engines.base_engine import BaseEngine
+from RealtimeTTS.audio_formats import AudioFormat
 
 try:
     from zonos import Zonos
@@ -68,7 +68,7 @@ class ZonosEngine(BaseEngine):
         # Audio configuration - Zonos typically outputs at 22050 Hz
         self.sample_rate = 22050
         self.channels = 1
-        self.format = pyaudio.paFloat32
+        self.format = AudioFormat.FLOAT32
         
         # Initialize model and speaker embedding
         self._load_model()
@@ -98,8 +98,8 @@ class ZonosEngine(BaseEngine):
             
     def get_stream_info(self):
         """
-        Returns the audio stream configuration information for PyAudio.
-        
+        Returns the audio stream configuration information.
+
         Returns:
             tuple: (format, channels, sample_rate)
         """
