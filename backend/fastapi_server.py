@@ -39,7 +39,7 @@ from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent
 from backend.RealtimeTTS.threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
-from backend.tts_service import TTSService, VoiceContext
+from tts_service import TTSService, VoiceContext
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
@@ -51,7 +51,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 sys.path.append('/workspace/tts/Code')
-
 
 class Character(BaseModel):
     id: str
@@ -151,7 +150,7 @@ class Queues:
 
         self.transcribed_text = asyncio.Queue()
 
-        self.text_queue = asyncio.Queue()
+        self.response_queue = asyncio.Queue()
 
         self.sentence_queue = asyncio.Queue()
 
@@ -403,7 +402,6 @@ class TextToSentence:
         # Signal end to CharIterator
         if self.char_iter:
             self.char_iter.add("")  # Empty string can signal completion
-            self.char_iter.complete()  # If this method exists
     
     def run_sentence_generator(self):
         """
@@ -481,7 +479,7 @@ class LLMService:
 
         self.is_initialized = False
         self.queues = queues
-        self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        self.client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key="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")
 
         # Active characters in the conversation
         self.active_characters: List[Character] = []
@@ -644,192 +642,66 @@ class LLMService:
             )
         return self.model_settings
 
-    def build_character_message_array(self, character: Character, is_multi_character: bool = True) -> List[Dict[str, str]]:
-        """
-        Build the message array for a specific character's LLM request.
+    async def main_llm_loop(self, user_name: str = "Jay"):
+        """Main LLM conversation loop for multi-character conversations."""
 
-        Message array structure:
-        1. System prompt (character-specific) - at the beginning
-        2. Conversation history (user and assistant messages)
-        3. Instruction message (for multi-character chats) - at the end
-
-        Args:
-            character: The character to build the message array for
-            is_multi_character: Whether this is a multi-character conversation
-
-        Returns:
-            List of message dicts ready for OpenRouter API
-        """
-        messages = []
-
-        # 1. Add character's system prompt at the beginning
-        messages.append({
-            "role": "system",
-            "content": character.system_prompt
-        })
-
-        # 2. Add conversation history (all user and assistant messages)
-        # The conversation history already contains all messages in order
-        for msg in self.conversation_history:
-            # Format message for API - include name in content for context
-            if msg.get("name"):
-                if msg["role"] == "user":
-                    messages.append({
-                        "role": "user",
-                        "content": f'{msg["name"]}: {msg["content"]}'
-                    })
-                else:  # assistant
-                    messages.append({
-                        "role": "assistant",
-                        "content": f'<{msg["name"]}>{msg["content"]}</{msg["name"]}>'
-                    })
-            else:
-                messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-
-        # 3. Add instruction message at the end (for multi-character chats)
-        if is_multi_character and len(self.active_characters) > 1:
-            messages.append(self.create_character_instruction_message(character))
-
-        return messages
-
-
-    async def main_llm_loop(self):
-        """
-        Main LLM conversation loop for multi-character conversations.
-
-        Flow:
-        1. Wait for user message from transcription queue
-        2. Add user message to conversation history
-        3. Parse which characters should respond (based on mentions)
-        4. For each responding character:
-           a. Build message array (system prompt + history + instruction)
-           b. Stream LLM response
-           c. Add character response to conversation history
-           d. Next character sees previous character's response
-        5. Repeat
-        """
         logger.info("Starting main LLM loop")
 
         while True:
             try:
-                # Wait for user message from transcription queue
+
                 user_message = await self.queues.transcribed_text.get()
 
                 if not user_message or not user_message.strip():
                     continue
 
-                logger.info(f"Processing user message: {user_message[:50]}...")
+                self.conversation_history.append({"role": "user", "name": user_name, "content": user_message})
 
-                # Add user message to conversation history
-                self.add_user_message(content=user_message, name="User")
+                mentioned_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
 
-                # Parse which characters should respond based on mentions
-                # Returns characters in order of mention
-                responding_characters = self.parse_character_mentions(
-                    message=user_message,
-                    active_characters=self.active_characters
-                )
-
-                logger.info(f"Characters responding: {[c.name for c in responding_characters]}")
-
-                # Determine if this is a multi-character conversation
-                is_multi_character = len(self.active_characters) > 1
-
-                # Generate responses for each character in sequence
-                for character in responding_characters:
-                    # Check for interrupt
+                for character in mentioned_characters:
                     if self.interrupt_event.is_set():
-                        logger.info("Interrupt detected, stopping character responses")
-                        self.interrupt_event.clear()
                         break
 
-                    # Reset per-response tracking
-                    self.reset_response_tracking()
+                    messages = []
 
-                    # Build message array for this character
-                    # Each subsequent character sees previous character's responses
-                    messages = self.build_character_message_array(
-                        character=character,
-                        is_multi_character=is_multi_character
-                    )
+                    messages.append({"role": "system", "name": character.name, "content": character.system_prompt})
 
-                    logger.info(f"Generating response for {character.name} with {len(messages)} messages")
+                    messages.extend(self.conversation_history)
 
-                    # Get model settings
-                    settings = self.get_model_settings()
+                    messages.append(self.create_character_instruction_message(character))
 
-                    # Create streaming completion request
+                    model_settings = self.get_model_settings()
+
                     text_stream = await self.client.chat.completions.create(
-                        model=settings.model,
+                        model=model_settings.model,
                         messages=messages,
-                        temperature=settings.temperature,
-                        top_p=settings.top_p,
-                        frequency_penalty=settings.frequency_penalty,
-                        presence_penalty=settings.presence_penalty,
-                        stream=True,
-                        extra_body={
-                            "min_p": settings.min_p,
-                            "top_k": settings.top_k,
-                            "repetition_penalty": settings.repetition_penalty
-                        }
+                        temperature=model_settings.temperature,
+                        top_p=model_settings.top_p,
+                        frequency_penalty=model_settings.frequency_penalty,
+                        presence_penalty=model_settings.presence_penalty,
+                        stream=True
                     )
 
-                    # Stream and process the response
-                    response_text = await self.character_response_stream(
-                        character=character,
-                        text_stream=text_stream
-                    )
+                    response_text = await self.character_response_stream(character=character, text_stream=text_stream)
 
-                    # Add character's response to conversation history
-                    # This way the next character will see this response
                     if response_text:
-                        # Strip character tags from response before adding to history
-                        clean_response = self.strip_character_tags(response_text)
-                        self.add_character_message(character=character, content=clean_response)
-                        logger.info(f"Added {character.name}'s response to history ({len(clean_response)} chars)")
+                        self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_text})
 
-            except asyncio.CancelledError:
-                logger.info("LLM loop cancelled")
-                break
             except Exception as e:
-                logger.error(f"Error in LLM loop: {e}", exc_info=True)
-
+                logger.error(f"Error in LLM loop: {e}")
 
     async def character_response_stream(self, character: Character, text_stream: AsyncIterator) -> str:
-        """
-        Generate and stream a single character's response.
+        """Generate and stream a single character's response."""
 
-        Handles:
-        - Streaming text chunks from LLM
-        - Feeding text to sentence extractor for TTS
-        - Sending text chunks to UI queue
-        - Accumulating full response text
-
-        Args:
-            character: The character whose response is being generated
-            text_stream: Async iterator of LLM response chunks
-
-        Returns:
-            The complete response text
-        """
-        # Generate unique message ID for this response
         message_id = f"msg-{character.id}-{int(time.time() * 1000)}"
 
         # Create new sentence extractor for this response
         self.sentence_extractor = TextToSentence()
         self.sentence_extractor.start()
-
-        # Store current character for sentence processing
-        self._current_character = character
-        self._current_message_id = message_id
-
+        
         # Create task for sentence-to-TTS processing
-        sentence_task = asyncio.create_task(
-            self.process_sentences_for_tts(character=character, message_id=message_id)
-        )
+        sentence_task = asyncio.create_task(self.process_sentences_for_tts(character=character, message_id=message_id))
 
         try:
             # Stream from LLM
@@ -840,15 +712,15 @@ class LLMService:
                     break
 
                 # Extract content from chunk
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
+                content = chunk.choices[0].delta.content
+                if content:
                     self.response_text += content
 
                     # Feed to sentence extractor (non-blocking)
                     self.sentence_extractor.feed_text(content)
 
                     # Stream to UI immediately
-                    text_chunk = TextChunk(
+                    response_chunk = TextChunk(
                         text=content,
                         message_id=message_id,
                         character_name=character.name,
@@ -856,14 +728,14 @@ class LLMService:
                         is_final=False,
                         timestamp=time.time()
                     )
-                    await self.queues.text_queue.put(text_chunk)
+                    await self.queues.response_queue.put(response_chunk)
                     self.chunk_index += 1
 
             # Signal LLM stream complete
             self.sentence_extractor.finish()
 
             # Send final text chunk to UI
-            final_text_chunk = TextChunk(
+            response_text = TextChunk(
                 text="",
                 message_id=message_id,
                 character_name=character.name,
@@ -871,7 +743,7 @@ class LLMService:
                 is_final=True,
                 timestamp=time.time()
             )
-            await self.queues.text_queue.put(final_text_chunk)
+            await self.queues.response_queue.put(response_text)
 
             # Wait for sentence processing to complete
             await sentence_task
@@ -1024,7 +896,6 @@ class TTSServiceManager:
 
         while not self._shutdown_event.is_set():
             try:
-                # Wait for sentence from queue (with timeout for shutdown check)
                 try:
                     sentence_tts: SentenceTTS = await asyncio.wait_for(
                         self.queues.tts_sentence_queue.get(),
@@ -1033,7 +904,6 @@ class TTSServiceManager:
                 except asyncio.TimeoutError:
                     continue
 
-                # Skip empty/final markers
                 if not sentence_tts.text or sentence_tts.is_final:
                     continue
 
@@ -1298,6 +1168,14 @@ class WebSocketManager:
         await self.queues.transcribed_text.put(user_message)
         # send final text to client for user's prompt UI display
         await self.send_text_to_client({"type": "stt_final", "text": user_message})
+
+    async def on_character_response_chunk(self, response_chunk: str):
+        await self.queues.response_queue.put(response_chunk)
+        await self.send_text_to_client({"type": "response_chunk", "text": response_chunk})
+
+    async def on_character_response_text(self, response_text: str):
+        await self.queues.response_queue.put(response_text)
+        await self.send_text_to_client({"type": "response_text", "text": response_text})
 
     async def disconnect(self):
         """Handle WebSocket disconnection"""
