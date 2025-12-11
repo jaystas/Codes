@@ -9,12 +9,6 @@ import { initEditor, handleMic, handleSend } from './editor.js';
 // Import characters functions
 import { initCharacters } from './characters.js';
 
-// Import chat manager
-import { chat } from './chat.js';
-
-// Import websocket
-import { websocket } from './websocket.js';
-
 // Make functions globally accessible for inline event handlers
 window.handleMic = handleMic;
 window.handleSend = handleSend;
@@ -586,14 +580,10 @@ function loadPage(page, container) {
     // Initialize editor if on home page
     if (page === 'home') {
       // Wait a bit for DOM to be ready
-      setTimeout(async () => {
+      setTimeout(() => {
         initEditor();
         initDrawer();
         initInfoDrawer();
-
-        // Initialize chat and connect websocket
-        await chat.initialize();
-        websocket.connect();
       }, 100);
     }
 
