@@ -1153,6 +1153,10 @@ class WebSocketManager:
                     await self.llm_service.load_active_characters_from_db()
                 logger.info("Active characters refreshed from database")
 
+            elif message_type == "ping":
+                # Respond to ping with pong for connection health check
+                await self.send_text_to_client({"type": "pong", "timestamp": time.time()})
+
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
 
