@@ -12,7 +12,14 @@ import TextAlign from 'https://esm.sh/@tiptap/extension-text-align';
 import Highlight from 'https://esm.sh/@tiptap/extension-highlight';
 import Image from 'https://esm.sh/@tiptap/extension-image';
 
+// Import chat system modules
+import * as sttAudio from './stt-audio.js';
+import * as ttsAudio from './tts-audio.js';
+import * as chat from './chat.js';
+
 let editor = null;
+let isMicActive = false;
+let isAudioInitialized = false;
 
 /**
  * Initialize the Tiptap editor
@@ -370,15 +377,63 @@ function addImage() {
 
 /**
  * Handle microphone button click
+ * Toggles between listening and idle states
  */
-export function handleMic() {
-  console.log('Microphone clicked');
-  // TODO: Implement voice input functionality
-  // This will be connected to the backend in the next phase
+export async function handleMic() {
+  const micButton = document.querySelector('.mic-button');
+
+  // Initialize audio on first click (browser requirement)
+  if (!isAudioInitialized) {
+    console.log('[Editor] Initializing audio capture...');
+    const success = await sttAudio.initAudioCapture();
+
+    if (!success) {
+      console.error('[Editor] Failed to initialize audio capture');
+      return;
+    }
+
+    isAudioInitialized = true;
+
+    // Subscribe to STT state changes for UI updates
+    sttAudio.onStateChange((newStatus, oldStatus) => {
+      updateMicButtonState(micButton, newStatus);
+    });
+  }
+
+  if (isMicActive) {
+    // Stop listening
+    sttAudio.stopRecording();
+    isMicActive = false;
+    updateMicButtonState(micButton, 'idle');
+    console.log('[Editor] Mic deactivated');
+  } else {
+    // Start listening
+    sttAudio.startRecording();
+    isMicActive = true;
+    console.log('[Editor] Mic activated');
+  }
+}
+
+/**
+ * Update mic button visual state
+ * @param {HTMLElement} button
+ * @param {string} status - 'idle' | 'listening' | 'recording' | 'paused'
+ */
+function updateMicButtonState(button, status) {
+  if (!button) return;
+
+  // Remove all state classes
+  button.classList.remove('listening', 'recording', 'paused');
+
+  // Add appropriate class
+  if (status !== 'idle') {
+    button.classList.add(status);
+  }
 }
 
 /**
  * Handle send button click
+ * Sends text content to server via chat module
  */
 export function handleSend() {
   if (!editor) {
@@ -386,14 +441,23 @@ export function handleSend() {
     return;
   }
 
-  const content = editor.getHTML();
-  console.log('Sending content:', content);
+  // Get plain text from editor (strip HTML tags for chat)
+  const content = editor.getText().trim();
 
-  // TODO: Send to backend API
-  // This will be implemented when integrating with FastAPI backend
+  if (!content) {
+    return; // Don't send empty messages
+  }
 
-  // Optionally clear the editor after sending
-  // editor.commands.clearContent();
+  console.log('[Editor] Sending message:', content);
+
+  // Stop any TTS playback when user sends a message
+  ttsAudio.stop();
+
+  // Send via chat module
+  chat.sendMessage(content);
+
+  // Clear the editor after sending
+  editor.commands.clearContent();
 }
 
 /**

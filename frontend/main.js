@@ -9,6 +9,11 @@ import { initEditor, handleMic, handleSend } from './editor.js';
 // Import characters functions
 import { initCharacters } from './characters.js';
 
+// Import chat system modules
+import * as websocket from './websocket.js';
+import * as chat from './chat.js';
+import * as ttsAudio from './tts-audio.js';
+
 // Make functions globally accessible for inline event handlers
 window.handleMic = handleMic;
 window.handleSend = handleSend;
@@ -580,10 +585,13 @@ function loadPage(page, container) {
     // Initialize editor if on home page
     if (page === 'home') {
       // Wait a bit for DOM to be ready
-      setTimeout(() => {
+      setTimeout(async () => {
         initEditor();
         initDrawer();
         initInfoDrawer();
+
+        // Initialize chat system
+        await initChatSystem();
       }, 100);
     }
 
@@ -845,7 +853,7 @@ function loadSettings() {
 }
 
 /**
- * Save settings to localStorage
+ * Save settings to localStorage and sync to server
  */
 function saveSettings() {
   const sliders = [
@@ -864,4 +872,74 @@ function saveSettings() {
       localStorage.setItem(id, slider.value);
     }
   });
+
+  // Sync to server
+  syncModelSettings();
+}
+
+// ============================================
+// CHAT SYSTEM INITIALIZATION
+// ============================================
+
+/**
+ * Initialize the chat system (WebSocket, TTS, Chat UI)
+ */
+async function initChatSystem() {
+  console.log('[Main] Initializing chat system...');
+
+  try {
+    // 1. Initialize TTS playback
+    await ttsAudio.initTTSPlayback();
+    console.log('[Main] TTS playback initialized');
+
+    // 2. Connect to WebSocket
+    await websocket.connect();
+    console.log('[Main] WebSocket connected');
+
+    // 3. Initialize chat UI
+    chat.initChat();
+    console.log('[Main] Chat UI initialized');
+
+    // 4. Sync model settings on connection
+    websocket.onConnectionChange((status) => {
+      if (status === 'connected') {
+        syncModelSettings();
+        websocket.refreshActiveCharacters();
+      }
+    });
+
+    // 5. Initial sync if already connected
+    if (websocket.isConnected()) {
+      syncModelSettings();
+      websocket.refreshActiveCharacters();
+    }
+
+    console.log('[Main] Chat system ready');
+
+  } catch (error) {
+    console.error('[Main] Failed to initialize chat system:', error);
+  }
+}
+
+/**
+ * Sync model settings to server via WebSocket
+ */
+function syncModelSettings() {
+  if (!websocket.isConnected()) {
+    return;
+  }
+
+  const settings = {
+    model: localStorage.getItem('selectedModel') || 'meta-llama/llama-3.1-8b-instruct',
+    temperature: parseFloat(localStorage.getItem('temperature') || '1.0'),
+    top_p: parseFloat(localStorage.getItem('top-p') || '1.0'),
+    min_p: parseFloat(localStorage.getItem('min-p') || '0.0'),
+    top_k: parseInt(localStorage.getItem('top-k') || '0'),
+    frequency_penalty: parseFloat(localStorage.getItem('frequency-penalty') || '0.0'),
+    presence_penalty: parseFloat(localStorage.getItem('presence-penalty') || '0.0'),
+    repetition_penalty: parseFloat(localStorage.getItem('repetition-penalty') || '1.0'),
+  };
+
+  websocket.updateModelSettings(settings);
+  console.log('[Main] Model settings synced:', settings.model);
 }
