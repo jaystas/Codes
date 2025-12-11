@@ -8,7 +8,6 @@
 import { characterCache } from './characterCache.js';
 import { realtimeSync } from './realtimeSync.js';
 import { handleSupabaseError } from './supabase.js';
-import { websocket } from './websocket.js';
 
 // Character data storage (populated from cache)
 let characters = [];
