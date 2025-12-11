@@ -370,24 +370,30 @@ function addImage() {
 
 /**
  * Handle microphone button click
- * Note: This is now handled by chat.js, but kept for backward compatibility
  */
 export function handleMic() {
-  // Import and delegate to chat manager
-  import('./chat.js').then(({ chat }) => {
-    chat.toggleMic();
-  });
+  console.log('Microphone clicked');
+  // TODO: Implement voice input functionality
+  // This will be connected to the backend in the next phase
 }
 
 /**
  * Handle send button click
- * Note: This is now handled by chat.js, but kept for backward compatibility
  */
 export function handleSend() {
-  // Import and delegate to chat manager
-  import('./chat.js').then(({ chat }) => {
-    chat.sendMessage();
-  });
+  if (!editor) {
+    console.warn('Editor not initialized');
+    return;
+  }
+
+  const content = editor.getHTML();
+  console.log('Sending content:', content);
+
+  // TODO: Send to backend API
+  // This will be implemented when integrating with FastAPI backend
+
+  // Optionally clear the editor after sending
+  // editor.commands.clearContent();
 }
 
 /**
