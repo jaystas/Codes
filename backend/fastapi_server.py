@@ -787,31 +787,31 @@ class LLMService:
             message_id: Unique ID for the current message
         """
         sentences_queued = []
-        sentence_idx = 0
+        sentence_index = 0
 
         try:
-            async for sentence_text, _ in self.sentence_extractor.get_sentences():
+            async for sentence, sentence_index in self.sentence_extractor.get_sentences():
                 # Check for interrupt
                 if self.interrupt_event.is_set():
                     break
 
-                sentences_queued.append(sentence_text)
+                sentences_queued.append(sentence)
 
                 # Queue for TTS immediately
                 sentence_tts = SentenceTTS(
-                    text=sentence_text,
+                    text=sentence,
                     speaker=character,
-                    voice=None,  # Voice will be resolved by TTS service
-                    sentence_index=sentence_idx,
+                    voice=voice,
+                    sentence_index=sentence_index,
                     is_final=False,
                     timestamp=time.time()
                 )
                 await self.queues.tts_sentence_queue.put(sentence_tts)
 
-                logger.info(f"Sentence {sentence_idx} queued for TTS ({character.name}): "
-                           f"{sentence_text[:50]}{'...' if len(sentence_text) > 50 else ''}")
+                logger.info(f"Sentence {sentence_index} queued for TTS ({character.name}): "
+                           f"{sentence[:50]}{'...' if len(sentence) > 50 else ''}")
 
-                sentence_idx += 1
+                sentence_index += 1
 
             # Send final marker for this character's TTS
             if sentences_queued:
@@ -819,7 +819,7 @@ class LLMService:
                     text="",  # Empty text signals completion
                     speaker=character,
                     voice=None,
-                    sentence_index=sentence_idx,
+                    sentence_index=sentence_index,
                     is_final=True,
                     timestamp=time.time()
                 )
@@ -832,157 +832,8 @@ class LLMService:
 ##--           TTS Service          --##
 ########################################
 
-class TTSServiceManager:
-    """
-    TTS Service Manager that wraps TTSService for FastAPI integration.
-
-    Handles:
-    - Sentence queue processing
-    - Voice context management per character
-    - Audio streaming to WebSocket
-    """
-
-    def __init__(self, queues: Queues):
-        self.queues = queues
-        self.tts_service: Optional[TTSService] = None
-        self.voice_contexts: Dict[str, VoiceContext] = {}
-        self.is_initialized = False
-        self._shutdown_event = asyncio.Event()
-
-    async def initialize(
-        self,
-        model_path: str = None,
-        audio_tokenizer_path: str = None,
-        device: str = None
-    ):
-        """Initialize the TTS service."""
-        logger.info("Initializing TTS Service Manager...")
-
-        self.tts_service = TTSService(
-            model_path=model_path,
-            audio_tokenizer_path=audio_tokenizer_path,
-            device=device,
-        )
-        await self.tts_service.initialize()
-        self.is_initialized = True
-
-        logger.info("TTS Service Manager initialized")
-
-    async def get_or_create_voice_context(
-        self,
-        character: Character,
-        voice: Optional[Voice] = None
-    ) -> VoiceContext:
-        """
-        Get existing voice context or create new one for character.
-
-        This maintains voice consistency by reusing contexts with
-        accumulated generation history.
-        """
-        if character.id in self.voice_contexts:
-            return self.voice_contexts[character.id]
-
-        # Extract voice settings from Voice dataclass or defaults
-        speaker_desc = voice.speaker_desc if voice else ""
-        scene_prompt = voice.scene_prompt if voice else "Audio is recorded from a quiet room."
-        ref_audio_path = voice.audio_path if voice and voice.audio_path else None
-        ref_audio_text = None
-
-        # Read reference audio transcript if available
-        if voice and voice.text_path and os.path.exists(voice.text_path):
-            with open(voice.text_path, 'r', encoding='utf-8') as f:
-                ref_audio_text = f.read().strip()
-
-        voice_ctx = await self.tts_service.create_voice_context(
-            character_id=character.id,
-            speaker_desc=speaker_desc,
-            scene_prompt=scene_prompt,
-            ref_audio_path=ref_audio_path,
-            ref_audio_text=ref_audio_text,
-        )
-
-        self.voice_contexts[character.id] = voice_ctx
-        return voice_ctx
-
-    async def main_tts_loop(self, send_audio_callback: Callable[[bytes], Awaitable[None]]):
-        """
-        Main TTS processing loop.
-
-        Consumes sentences from tts_sentence_queue, generates audio,
-        and streams chunks via callback.
-        """
-        logger.info("TTS main loop started")
-
-        while not self._shutdown_event.is_set():
-            try:
-                try:
-                    sentence_tts: SentenceTTS = await asyncio.wait_for(
-                        self.queues.tts_sentence_queue.get(),
-                        timeout=0.5
-                    )
-                except asyncio.TimeoutError:
-                    continue
-
-                if not sentence_tts.text or sentence_tts.is_final:
-                    continue
-
-                # Get or create voice context for this character
-                voice_ctx = await self.get_or_create_voice_context(character=sentence_tts.speaker, voice=sentence_tts.voice)
-
-                logger.info(f"🔊 Generating TTS for sentence {sentence_tts.sentence_index}: "
-                           f"'{sentence_tts.text[:50]}...' ({sentence_tts.speaker.name})")
-
-                # Generate and stream audio
-                chunk_index = 0
-                async for audio_bytes in self.tts_service.generate_audio_stream(text=sentence_tts.text, voice_context=voice_ctx):
-                    
-                    # Create audio chunk with metadata
-                    audio_chunk = AudioChunk(
-                        chunk_id=f"{sentence_tts.sentence_index}-chunk-{chunk_index}",
-                        message_id=f"msg-{sentence_tts.timestamp}",
-                        character_id=sentence_tts.speaker.id,
-                        character_name=sentence_tts.speaker.name,
-                        audio_data=audio_bytes,
-                        chunk_index=chunk_index,
-                        is_final=False,
-                    )
-
-                    # Put in audio queue for WebSocket streaming
-                    await self.queues.audio_queue.put(audio_chunk)
-
-                    # Also send via callback for immediate streaming
-                    await send_audio_callback(audio_bytes)
-
-                    chunk_index += 1
-
-                logger.info(f"✅ TTS complete for sentence {sentence_tts.sentence_index} "
-                           f"({chunk_index} chunks)")
-
-            except asyncio.CancelledError:
-                logger.info("TTS loop cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Error in TTS loop: {e}")
-                continue
-
-        logger.info("TTS main loop stopped")
-
-    def clear_voice_context(self, character_id: str):
-        """Clear voice context history for a character."""
-        if character_id in self.voice_contexts:
-            self.voice_contexts[character_id].clear_history()
-
-    def clear_all_voice_contexts(self):
-        """Clear all voice context histories."""
-        for voice_ctx in self.voice_contexts.values():
-            voice_ctx.clear_history()
-
-    async def shutdown(self):
-        """Shutdown TTS service."""
-        self._shutdown_event.set()
-        if self.tts_service:
-            await self.tts_service.shutdown()
-        logger.info("TTS Service Manager shut down")
+class TTSService:
+    """TTS placeholder"""
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -994,7 +845,7 @@ class WebSocketManager:
     def __init__(self):
         self.stt_service: Optional[STTService] = None
         self.llm_service: Optional[LLMService] = None
-        self.tts_service: Optional[TTSServiceManager] = None
+        self.tts_service: Optional[TTSService] = None
         self.websocket: Optional[WebSocket] = None
         self.queues: Optional[Queues] = None
         self.service_tasks: List[asyncio.Task] = []
@@ -1028,7 +879,7 @@ class WebSocketManager:
         await self.llm_service.initialize()
 
         # Initialize TTS Service Manager with queues
-        self.tts_service = TTSServiceManager(queues=self.queues)
+        self.tts_service = TTSService(queues=self.queues)
         await self.tts_service.initialize()
 
         logger.info("WebSocketManager initialized")
@@ -1280,4 +1131,3 @@ app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
