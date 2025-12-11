@@ -169,7 +169,7 @@ class STTService:
         self.recorder: Optional[AudioToTextRecorder] = None
         self.recording_thread: Optional[threading.Thread] = None
         self.callbacks: Dict[str, Any] = {}
-        self.is_listening = False
+        self.is_listening = threading.Event()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
     def initialize(self):
@@ -212,7 +212,7 @@ class STTService:
         logger.info("STT recording loop started")
 
         while True:
-            if self.is_listening:
+            if self.is_listening.is_set():
                 try:
                     # Get transcription from recorder
                     text = self.recorder.text()
@@ -221,7 +221,7 @@ class STTService:
                         logger.info(f"Final transcription: {text}")
                         self._on_final_transcription(text)
                     else:
-                        print(e)
+                        logger.info("Empty transcription received")
                     
                     self.is_listening.clear()
                     
@@ -264,6 +264,16 @@ class STTService:
         """Called when voice activity stops during recording"""
         if self.callbacks.on_vad_stop:
             self._schedule_callback(self.callbacks.on_vad_stop)
+
+    def start_listening(self):
+        """Start listening for voice activity"""
+        self.is_listening = True
+        if self.recorder:
+            self.recorder.listen()
+
+    def stop_listening(self):
+        """Stop listening"""
+        self.is_listening = False
     
     def _on_recording_start(self):
         """Called when recording starts"""
@@ -275,25 +285,33 @@ class STTService:
         if self.callbacks.on_recording_stop:
             self._schedule_callback(self.callbacks.on_recording_stop)
 
+    def feed_audio(self, audio_bytes: bytes):
+        """Feed raw PCM audio bytes (16kHz, 16-bit, mono)"""
+        if self.recorder:
+            try:
+                self.recorder.feed_audio(audio_bytes, original_sample_rate=16000)
+            except Exception as e:
+                logger.error(f"Failed to feed audio to recorder: {e}")
+
 ########################################
 ##--       Callback Utilities       --##
 ########################################
     
     def _schedule_callback(self, callback: Callable, *args):
         """Schedule a callback to run, handling both sync and async callbacks"""
-        if self._loop is None:
+        if self.loop is None:
             return
             
         try:
             if asyncio.iscoroutinefunction(callback):
                 # Schedule async callback
-                self._loop.call_soon_threadsafe(
+                self.loop.call_soon_threadsafe(
                     lambda: asyncio.create_task(callback(*args))
                 )
 
             else:
                 # Schedule sync callback
-                self._loop.call_soon_threadsafe(callback, *args)
+                self.loop.call_soon_threadsafe(callback, *args)
         except Exception as e:
             logger.error(f"Error scheduling callback: {e}")
     
@@ -364,6 +382,7 @@ class TextToSentence:
         """Initialize and start the sentence extraction pipeline"""
         self.char_iter = CharIterator()
         self.thread_safe_iter = AccumulatingThreadSafeGenerator(self.char_iter)
+        self.sentence_queue = Queue()
         
         self._is_running = True
         self._is_complete = False
@@ -998,6 +1017,8 @@ class WebSocketManager:
         # Initialize STT service
         self.stt_service = STTService()
         self.stt_service.callbacks = stt_callbacks
+        self.stt_service.loop = asyncio.get_event_loop()
+        self.stt_service.initialize()
 
         # Initialize LLM service with queues and API key
         self.llm_service = LLMService(
@@ -1029,7 +1050,8 @@ class WebSocketManager:
 
         self.service_tasks = [
             asyncio.create_task(self.llm_service.main_llm_loop()),
-            asyncio.create_task(self.tts_service.main_tts_loop(send_audio_callback=self.stream_audio_to_client))
+            asyncio.create_task(self.tts_service.main_tts_loop(send_audio_callback=self.stream_audio_to_client)),
+            asyncio.create_task(self.stream_text_to_client())
         ]
 
     async def shutdown(self):
@@ -1059,11 +1081,6 @@ class WebSocketManager:
 
         logger.info("WebSocket Manager services shut down")
     
-    async def handle_audio_message(self, audio_data: bytes):
-        """Feed audio for transcription"""
-        if self.stt_service:
-            self.stt_service.feed_audio(audio_data)
-
     async def handle_text_message(self, message: str):
         """Handle incoming text messages from WebSocket client"""
         try:
@@ -1072,22 +1089,18 @@ class WebSocketManager:
             payload = data.get("data", {})
 
             if message_type == "user_message":
-                # Handle user text message
                 user_message = payload.get("text", "")
                 await self.handle_user_message(user_message)
 
             elif message_type == "start_listening":
-                # Start STT listening
                 if self.stt_service:
                     self.stt_service.start_listening()
 
             elif message_type == "stop_listening":
-                # Stop STT listening
                 if self.stt_service:
                     self.stt_service.stop_listening()
 
             elif message_type == "model_settings":
-                # Update model settings for LLM
                 settings_data = payload
                 model_settings = ModelSettings(
                     model=settings_data.get("model", "meta-llama/llama-3.1-8b-instruct"),
@@ -1143,9 +1156,31 @@ class WebSocketManager:
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
 
+    async def handle_audio_message(self, audio_data: bytes):
+        """Feed audio for transcription"""
+        if self.stt_service:
+            self.stt_service.feed_audio(audio_data)
+
     async def handle_user_message(self, user_message: str):
         """Process manually sent user message"""
         await self.queues.transcribed_text.put(user_message)
+
+    async def stream_text_to_client(self):
+        """Stream text chunks from response_queue to WebSocket"""
+        while True:
+            try:
+                text_chunk: TextChunk = await self.queues.response_queue.get()
+                await self.send_text_to_client({
+                    "type": "text_chunk",  # Must match frontend MESSAGE_TYPES.TEXT_CHUNK
+                    "data": {
+                        "text": text_chunk.text,
+                        "character_name": text_chunk.character_name,
+                        "message_id": text_chunk.message_id,
+                        "is_final": text_chunk.is_final
+                    }
+                })
+            except Exception as e:
+                logger.error(f"Error streaming text: {e}")
 
     async def send_text_to_client(self, data: dict):
         """Send JSON message to client"""
@@ -1164,9 +1199,7 @@ class WebSocketManager:
         await self.send_text_to_client({"type": "stt_stabilized", "text": text})
     
     async def on_final_transcription(self, user_message: str):
-        # put transcribed text into queue for llm to get
         await self.queues.transcribed_text.put(user_message)
-        # send final text to client for user's prompt UI display
         await self.send_text_to_client({"type": "stt_final", "text": user_message})
 
     async def on_character_response_chunk(self, response_chunk: str):
