@@ -1166,17 +1166,17 @@ class WebSocketManager:
         await self.queues.transcribed_text.put(user_message)
 
     async def stream_text_to_client(self):
-        """Stream text chunks from response_queue to WebSocket"""
+        """Stream response/text chunks from response_queue to WebSocket"""
         while True:
             try:
-                text_chunk: TextChunk = await self.queues.response_queue.get()
+                response_chunk: TextChunk = await self.queues.response_queue.get()
                 await self.send_text_to_client({
-                    "type": "text_chunk",  # Must match frontend MESSAGE_TYPES.TEXT_CHUNK
+                    "type": "response_chunk",
                     "data": {
-                        "text": text_chunk.text,
-                        "character_name": text_chunk.character_name,
-                        "message_id": text_chunk.message_id,
-                        "is_final": text_chunk.is_final
+                        "text": response_chunk.text,
+                        "character_name": response_chunk.character_name,
+                        "message_id": response_chunk.message_id,
+                        "is_final": response_chunk.is_final
                     }
                 })
             except Exception as e:
@@ -1276,3 +1276,4 @@ app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
